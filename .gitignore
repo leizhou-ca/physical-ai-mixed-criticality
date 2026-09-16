@@ -1,0 +1,16 @@
+mcib-private/
+rtos_benchmark/
+
+CLAUDE.md
+# Catch any context files placed at repo root accidentally
+*_context.md
+*_context_*.md
+
+# Editor and OS artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+briefs
+briefs/reports/
