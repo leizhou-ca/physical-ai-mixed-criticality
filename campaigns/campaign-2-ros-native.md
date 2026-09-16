@@ -2,7 +2,7 @@
 
 **Status:** Outline. Activation gated on the reference-platform campaign
 reaching its bring-up exit criteria.
-**Governed by:** MCIB Specification v1.3. The phase-aware EVT requirement
+**Governed by:** MCIB Specification. The phase-aware EVT requirement
 (§1.4) and the `bottleneck_class` schema field (§2) are inherited by
 reference — ROS-native victim measurements and any autoregressive inference
 aggressor runs are subject to the §1.4 phase decomposition requirement.

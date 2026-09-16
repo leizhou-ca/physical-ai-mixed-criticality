@@ -3,6 +3,11 @@
 **Status:** Draft. Normative once frozen. · **Author:** Lei Zhou, Linaro
 **License:** CC BY 4.0
 
+**2026-09-14:** §1.1 F2 cross-boundary endpoint rule and clock-domain
+constraint added as NORMATIVE; §1.3 three declarations added
+(control-loop rate, timestamp domain, boundary transport); §2
+`deployment_config` and `timestamp_domain` added as schema fields.
+
 **Change policy:** revisions only when a campaign demonstrates necessity;
 all revisions versioned with migration notes. Stability is a feature.
 
@@ -57,6 +62,39 @@ representative control chain (e.g., periodic control loop, ROS 2
 callback chain, observe-infer-act pipeline). Chain definition is
 campaign-specific; reporting rules (§1.4) are not.
 
+**F2 cross-boundary endpoint rule `[NORMATIVE]`:** where the same
+logical chain is measured in more than one deployment configuration —
+configurations differing in where the control element executes, such as
+a real-time guest on application cores versus a discrete real-time core —
+the chain endpoints MUST be defined at the same semantic points in every
+configuration, and the definition MUST be stated before any configuration
+is measured.
+
+```
+T0  the actuating input is available at the producer
+    — the producing stage has completed and the value is ready
+      to hand off, timestamped before any transport call
+T1  the actuating input is applied at the control element
+    — the consuming stage has taken the value into effect at its
+      output boundary
+Chain latency = T1 - T0
+```
+
+Configurations measured in this way run at differing control-loop rates
+and their raw distributions are NOT directly comparable. Comparability
+is established by the endpoint definition above plus the declarations in
+§1.3, never by post-hoc normalisation.
+
+**Clock-domain constraint `[NORMATIVE]`:** where T0 and T1 are read on
+different cores or in different execution domains, a run MUST declare
+whether both timestamps derive from the same architected counter at the
+same frequency, and MUST record the confirmation. Where they do not, the
+cross-boundary interval is NOT reportable as a primary result: each
+configuration reports a consumer-side interval instead, with the
+boundary transport characterised separately. Rationale: a clock-domain
+mismatch perturbs a latency measurement silently and by a magnitude that
+can exceed the effect under study.
+
 **F3 — Device-path latencies (paired-path method):** guest-observed
 request→completion latency for a virtualized device path, always
 reported against a passthrough or native baseline of the same device
@@ -81,6 +119,18 @@ pre-faulting; DVFS state; idle-state policy; CPU isolation method;
 IRQ affinity policy; cache-state control (cold/warm); RT throttling
 state; thermal management state. Deviations are permitted but MUST be
 declared in provenance.
+
+A run reporting an F2 chain additionally declares:
+
+- **Control-loop rate** — stated, never inferred from the data. Loop
+  rate is a configuration parameter of the run.
+- **Timestamp domain** — for each of T0 and T1, which counter the
+  timestamp was read from, and whether the two share a domain and
+  frequency (§1.1 clock-domain constraint).
+- **Boundary transport** — the mechanism carrying the value from T0 to
+  T1 where the chain crosses an execution-domain or criticality
+  boundary, and whether its cost is inside or outside the reported
+  interval.
 
 ### 1.4 Reporting rules
 
@@ -126,7 +176,20 @@ dataset — no external identifier registry. Core fields per run:
 `metric_id`, `victim_class`, `aggressor_config`, `isolation_config`,
 `stressor_condition`, `samples`, `p50_us`, `p99_us`, `p999_us`,
 `max_us`, `os_path_floor_us`, `contention_tail_us`, `pwcet_evt_us`,
-`pwcet_confidence`, `primary_rc`, `bottleneck_class`.
+`pwcet_confidence`, `primary_rc`, `bottleneck_class`,
+`deployment_config`, `timestamp_domain`.
+
+**`deployment_config` `[NORMATIVE]` (F2 runs):** identifies the
+deployment configuration of the control element for the measured chain,
+so results from configurations differing in where control executes are
+never silently pooled. Free-form campaign-defined identifier; the
+campaign declares the set it uses. Absent on non-F2 runs.
+
+**`timestamp_domain` `[NORMATIVE]` (F2 runs crossing a boundary):**
+declares the counter source for T0 and T1 and whether they share a
+domain and frequency, per the §1.1 clock-domain constraint. A
+cross-boundary interval reported as a primary result without this field
+is non-conforming.
 
 **`bottleneck_class` `[NORMATIVE]`:** mandatory typed field declaring
 the aggressor's primary resource binding — the resource dimension the
