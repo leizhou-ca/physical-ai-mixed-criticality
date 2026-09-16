@@ -1,6 +1,5 @@
 # MCIB — Mixed-Criticality Interference Benchmark
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20967588.svg)](https://doi.org/10.5281/zenodo.20967588)
 [![License: Apache 2.0](https://img.shields.io/badge/code-Apache--2.0-blue.svg)](LICENSE)
 [![License: CC BY 4.0](https://img.shields.io/badge/docs-CC%20BY%204.0-lightgrey.svg)](LICENSE-docs)
 
@@ -32,9 +31,9 @@ and it terminates in a verdict for each measured outlier:
 
 | Verdict | Meaning |
 |---|---|
-| **Tuning** | Fixable by configuration (affinity, isolation, scheduling policy) |
-| **Partitionable** | Fixable by hardware partitioning (MPAM, cache coloring, SMMU) |
-| **Ceiling** | A structural limit of the platform; no configuration will move it |
+| `tune` | Fixable by configuration — affinity, isolation, scheduling policy |
+| `partition` | Fixable by hardware partitioning — MPAM, cache colouring, SMMU |
+| `ceiling` | A structural limit of the platform; no configuration will move it |
 
 A benchmark that reports numbers without a verdict leaves the reader with
 homework. MCIB treats the verdict as the deliverable.
@@ -98,10 +97,11 @@ framework/    Benchmark harness (skeleton — see Status)
 
 ## Reference platform
 
-Campaign #1 targets the **Sparrow Hawk SBC** (Renesas R-Car V4H) with the
-community SDVoS BSP stack. The specification itself is platform-neutral and
-ISA-neutral; the reference implementation is Arm-first because that is where
-the mixed-criticality silicon is.
+Campaign #1 targets the **Sparrow Hawk SBC** (Renesas R-Car V4H) running AGL
+SoDeV, a Xen-based multi-domain stack. This is the first port, not the only
+intended one. The specification itself is platform-neutral and ISA-neutral;
+the reference implementation is Arm-first because that is where the
+mixed-criticality silicon is.
 
 ---
 

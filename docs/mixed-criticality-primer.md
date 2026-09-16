@@ -176,7 +176,7 @@ is horizontal framework legislation, not a replacement for these.
 
 MCIB measures interference between inference and control workloads on shared
 silicon, attributes each outlier to a mechanism, and returns a verdict:
-**tuning**, **partitionable**, or **ceiling**.
+`tune`, `partition`, or `ceiling`.
 
 That output is characterisation data. It is not qualified safety evidence — the
 toolchain is unqualified, and nothing here should be presented as certification

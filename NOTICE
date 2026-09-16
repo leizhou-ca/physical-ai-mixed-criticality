@@ -3,9 +3,7 @@ Copyright 2026 Linaro Ltd.
 
 This product includes software developed at Linaro Ltd.
 
-MCIB is a new project. It shares no code with, and incorporates no material
-from, earlier benchmark work by the same author. That work inspired this
-project and is published as:
+MCIB is a new open-source project, inspired by earlier benchmark work published as:
 
   Zhou, L. (2026). Is Linux RT-PREEMPT Ready for Automotive Safety-Critical
   Workloads? A Systematic Benchmark Evaluation. Embedded World Conference
