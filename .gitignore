@@ -14,3 +14,5 @@ CLAUDE.md
 .vscode/
 briefs
 briefs/reports/
+__pycache__/
+*.pyc
