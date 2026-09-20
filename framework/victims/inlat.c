@@ -57,7 +57,20 @@
 #include "mcib_probe.h"
 #include "victim_common.h"
 
-enum { PT_TRIGGER = 1, PT_RESUME = 2 };
+/* PT_WAIT_ENTER is not an end of the interval. It is where the WAITER's
+ * counter segment opens: the last instruction before it blocks in poll().
+ * The interval still runs from the trigger's mark to the waiter's, and still
+ * pairs on the token — what this third point provides is a counter delta
+ * belonging to ONE context and bracketing the block, so it contains the
+ * interrupt-delivery and wake path and nothing else. Per-thread counters stop
+ * while the thread is blocked, so the wait itself contributes no counts.
+ *
+ * It is taken AFTER the ready-pipe write and before poll(), and that order is
+ * what keeps it outside the interval. The trigger is the lower-priority
+ * thread on the same core: the write unblocks it, but it cannot be scheduled
+ * until the waiter blocks. So the mark is always taken before the trigger can
+ * drive the edge, never inside the measured section. */
+enum { PT_TRIGGER = 1, PT_RESUME = 2, PT_WAIT_ENTER = 3 };
 
 /* Wiring, fixed: GPIO17 (header pin 11) out, GPIO27 (header pin 13) in,
  * looped by a wire, through the character device. */
@@ -203,15 +216,19 @@ static int pin_and_prioritise(int cpu, int prio)
     return 0;
 }
 
-static mcib_probe_t *open_context(const char *ctx)
+/* `marks_per_iteration` is not cosmetic. The waiter records two events per
+ * iteration and the trigger one, so the buffer it needs and the number of
+ * warm-up events it must discard are twice the trigger's. Sizing both from
+ * the iteration count alone would silently truncate the waiter's record. */
+static mcib_probe_t *open_context(const char *ctx, long marks_per_iteration)
 {
     mcib_error_t err = {0};
     mcib_probe_config_t cfg = {
         .metric            = "inlat",
         .context_name      = ctx,
         .execution_context = opt_exec_context,
-        .warmup_events     = (uint32_t)opt_warmup,
-        .capacity          = (uint32_t)(opt_iters + 16),
+        .warmup_events     = (uint32_t)(opt_warmup * marks_per_iteration),
+        .capacity          = (uint32_t)(opt_iters * marks_per_iteration + 16),
         .counters          = opt_counters != 0,
         .counter_set       = opt_counter_set,
         /* Both readings on every event: the interval is built from the
@@ -225,7 +242,8 @@ static mcib_probe_t *open_context(const char *ctx)
     return p;
 }
 
-static void close_context(mcib_probe_t *p, const char *ctx)
+static void close_context(mcib_probe_t *p, const char *ctx,
+                          long marks_per_iteration)
 {
     uint64_t fmin = 0, fmaj = 0;
     bool fok = false;
@@ -238,7 +256,8 @@ static void close_context(mcib_probe_t *p, const char *ctx)
                  (unsigned long long)fmin, (unsigned long long)fmaj);
         victim_fail(&in_status, m);
     }
-    if (victim_short_run(mcib_probe_count(p), (uint64_t)opt_iters, ctx))
+    if (victim_short_run(mcib_probe_count(p),
+                         (uint64_t)(opt_iters * marks_per_iteration), ctx))
         victim_fail(&in_status, "a measured context recorded a short run");
 
     mcib_error_t err = {0};
@@ -263,7 +282,7 @@ static void *waiter(void *arg)
         pthread_barrier_wait(&start_barrier);
         return NULL;
     }
-    mcib_probe_t *p = open_context("waiter");
+    mcib_probe_t *p = open_context("waiter", 2);
     if (!p) { pthread_barrier_wait(&start_barrier); return NULL; }
     pthread_barrier_wait(&start_barrier);
 
@@ -273,6 +292,9 @@ static void *waiter(void *arg)
         struct pollfd pfd = { .fd = in_fd, .events = POLLIN };
         if (write(ready_pipe[1], &one, 1) != 1) break;
 
+        /* The counter segment opens here, in this context, and closes at the
+         * resume mark below. Nothing is differenced across the two threads. */
+        mcib_probe_mark(p, PT_WAIT_ENTER, (uint64_t)i + 1);
         int r = poll(&pfd, 1, POLL_TIMEOUT_MS);
         mcib_probe_mark_boundary(p, PT_RESUME, (uint64_t)i + 1);
 
@@ -293,7 +315,7 @@ static void *waiter(void *arg)
         if (i == total - 1)      mcib_probe_run_end(p);
     }
 
-    close_context(p, "waiter");
+    close_context(p, "waiter", 2);
     return NULL;
 }
 
@@ -306,7 +328,7 @@ static void *trigger(void *arg)
         pthread_barrier_wait(&start_barrier);
         return NULL;
     }
-    mcib_probe_t *p = open_context("trigger");
+    mcib_probe_t *p = open_context("trigger", 1);
     if (!p) { pthread_barrier_wait(&start_barrier); return NULL; }
     pthread_barrier_wait(&start_barrier);
 
@@ -331,7 +353,7 @@ static void *trigger(void *arg)
         if (i == total - 1)      mcib_probe_run_end(p);
     }
 
-    close_context(p, "trigger");
+    close_context(p, "trigger", 1);
     return NULL;
 }
 

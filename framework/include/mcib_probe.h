@@ -102,6 +102,10 @@ typedef enum {
 
 /* ---------------------------------------------------------------- config */
 
+/* A counter accumulator shared by the contexts of one core-owned interval.
+ * See the block below the configuration for what it is for and who owns it. */
+typedef struct mcib_core_counters mcib_core_counters_t;
+
 typedef struct {
     const char       *metric;         /* stable metric identifier          */
     const char       *context_name;   /* this context's name in the record */
@@ -122,9 +126,58 @@ typedef struct {
      * and the record carries the name and the declared properties so a
      * reader can tell which was used. */
     const char       *counter_backend;
+    /* A core-scoped handle to REFERENCE instead of opening a private one.
+     * Only for a core-owned interval. When set, the probe takes its backend
+     * and its counter set from the handle and never closes it; naming a
+     * different set or backend beside it is refused rather than silently
+     * resolved one way. */
+    mcib_core_counters_t *core_counters;
     mcib_kts_policy_t kts_policy;
     uint16_t          domain_id;      /* clock domain this context reads   */
 } mcib_probe_config_t;
+
+/* ---------------------------------------------- core-scoped counter handle
+ *
+ * A COUNTER DELTA NEEDS A SHARED ACCUMULATOR ORIGIN, exactly as a
+ * cross-domain interval needs a shared clock origin. A counter is an
+ * accumulator: two events opened separately begin counting when each was
+ * opened, so two contexts holding two handles on the same core hold two
+ * accumulators with different origins — not one stream read twice. Binding
+ * the counter to the core fixes WHAT is counted; it does not make WHOSE
+ * accumulator it is counted in irrelevant. Measured on this platform, the
+ * difference across two such handles carried a constant offset of 47.7
+ * million cycles and came out negative on half the intervals.
+ *
+ * Where an interval is CORE-OWNED — one context leaves, another resumes, and
+ * neither is present at both ends — the delta has to span two contexts, so
+ * the origin problem cannot be avoided by placing the snapshots better. It
+ * is avoided by there being one accumulator: a handle opened once for the
+ * core and REFERENCED by the probes that mark on it, owned by none of them.
+ *
+ * This is a scoped exception to one-probe-per-context, and the scope is
+ * exactly the core-owned case. A context-owned interval keeps its own
+ * handle, because there the peer's execution is contamination rather than
+ * the other half of the measurement.
+ *
+ * ORDERING, which the caller owns: the handle must exist before either
+ * context marks, and must be opened from a context ALREADY PINNED to the
+ * core it counts. The backend verifies the pinning and refuses otherwise; it
+ * cannot verify the first, which is why it is stated here.
+ *
+ * LIFETIME: the probes borrow it. A probe opened with one never closes it,
+ * and the caller closes it after every probe that referenced it is closed.
+ *
+ * The type is declared above, beside the configuration field that takes it. */
+
+/* Open one accumulator for the core the CALLING context is pinned to.
+ * `counter_set` selects the named set, `backend` the access backend — which
+ * must be a CPU-bound one, since a thread-bound handle shared between two
+ * contexts would follow whichever thread opened it. */
+int  mcib_core_counters_open(const char *counter_set, const char *backend,
+                             mcib_core_counters_t **out, mcib_error_t *err);
+void mcib_core_counters_close(mcib_core_counters_t *h);
+/* The core it was opened on, for the caller to record and check. */
+int  mcib_core_counters_cpu(const mcib_core_counters_t *h);
 
 typedef struct mcib_probe mcib_probe_t;
 

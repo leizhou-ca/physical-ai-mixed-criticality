@@ -104,6 +104,22 @@ static int pin_and_prioritise(int cpu, int prio)
 
 /* One measured context. Identical in both threads: the metric is symmetric,
  * and any asymmetry between them would land in the measurement. */
+/* The one accumulator both contexts read.
+ *
+ * WHY IT IS HERE AND NOT IN EITHER THREAD. This interval is core-owned: one
+ * thread yields, the other resumes, and neither is present at both ends. Its
+ * counter delta must therefore span the two contexts, and a difference
+ * between two separately-opened accumulators is not a delta — measured on
+ * this platform, it carried a constant 47.7 million cycles of offset and came
+ * out negative on half the intervals. One handle, referenced by both, removes
+ * the origin rather than estimating it.
+ *
+ * Opened by main, which pins itself to the measured core first, so the
+ * ordering rule holds by construction: the handle exists before either
+ * context is created, let alone marks, and it was opened from a context
+ * pinned to the core it counts. Main then does nothing but join. */
+static mcib_core_counters_t *core_counters;
+
 static void *yielder(void *arg)
 {
     const char *ctx = (const char *)arg;
@@ -122,8 +138,12 @@ static void *yielder(void *arg)
         .warmup_events     = (uint32_t)(opt_warmup * 2),  /* two marks/iter */
         .capacity          = (uint32_t)(opt_iters * 2 + 16),
         .counters          = opt_counters != 0,
-        .counter_set       = opt_counter_set,
-        .counter_backend   = opt_counter_backend,
+        /* The handle carries the set and the backend when there is one, so
+         * they are passed only when there is not. Passing both is refused by
+         * the probe rather than resolved one way. */
+        .counter_set       = core_counters ? NULL : opt_counter_set,
+        .counter_backend   = core_counters ? NULL : opt_counter_backend,
+        .core_counters     = core_counters,
         .kts_policy        = MCIB_KTS_EVERY_EVENT,
         /* One domain: same process, same core, same counter register. The
          * record states the identity and frequency so the claim is checkable. */
@@ -235,6 +255,35 @@ int main(int argc, char **argv)
 
     victim_status_init(&ts_status);
 
+    /* Pin main to the measured core before opening the handle: the backend
+     * refuses a caller that is not pinned to exactly one CPU, and a handle
+     * opened on the wrong core would count a core nobody is measuring. Main
+     * blocks in pthread_join for the rest of the run, so sharing the core
+     * with the two measured threads costs them nothing. */
+    if (opt_counters) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(opt_cpu, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof set, &set) != 0) {
+            fprintf(stderr, "victim: cannot pin to CPU%d to open the "
+                            "core-scoped counter handle: %s\n",
+                    opt_cpu, strerror(errno));
+            return 1;
+        }
+        mcib_error_t cerr = {0};
+        if (mcib_core_counters_open(opt_counter_set,
+                                    opt_counter_backend
+                                        ? opt_counter_backend
+                                        : "linux-perf-percpu",
+                                    &core_counters, &cerr) != 0) {
+            fprintf(stderr, "victim: %s\n", cerr.msg);
+            return 1;
+        }
+        printf("core-scoped counter handle: set %s on cpu%d, referenced by "
+               "both contexts\n", opt_counter_set,
+               mcib_core_counters_cpu(core_counters));
+    }
+
     if (pthread_barrier_init(&start_barrier, NULL, 2) != 0) {
         perror("pthread_barrier_init"); return 1;
     }
@@ -247,6 +296,9 @@ int main(int argc, char **argv)
     pthread_join(ta, NULL);
     pthread_join(tb, NULL);
     pthread_barrier_destroy(&start_barrier);
+    /* After every probe that referenced it has closed. */
+    mcib_core_counters_close(core_counters);
+    core_counters = NULL;
 
     const char *msg = NULL;
     if (victim_failed(&ts_status, &msg)) {

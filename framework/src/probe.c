@@ -144,6 +144,12 @@ struct mcib_probe {
     const mcib_counter_set_t     *set;
     void                         *bectx;
     bool                          counters;
+    /* True when `bectx` is BORROWED from a core-scoped handle rather than
+     * opened by this probe. A borrowed handle is never closed here: it
+     * outlives every probe that referenced it, and closing it from one of
+     * them would stop the accumulator the others are still reading. */
+    bool                          counters_borrowed;
+    int                           core_cpu;
 
     /* Time source, chosen by measurement at open. */
     const mcib_time_source_t *tsrc;
@@ -405,6 +411,92 @@ static const char *policy_name(int pol)
 
 /* -------------------------------------------------------------- open */
 
+/* ---------------------------------------------- core-scoped counter handle
+ *
+ * One accumulator for one core, referenced by the probes of a core-owned
+ * interval. The whole of its reason for existing is that a difference
+ * between two readings requires the two readings to share an origin: two
+ * handles on the same core are two accumulators, and their difference
+ * carries the gap between their opens, which was measured here at 47.7
+ * million cycles.
+ *
+ * It is deliberately thin. It owns the backend context and nothing else; the
+ * probes that reference it do the reading, and each writes its own record.
+ * Nothing is shared in the hot path but the file descriptor the backend
+ * already reads through, so no synchronisation is added to a measured
+ * section — which is the constraint that rules out every arrangement where
+ * one context reads on another's behalf. */
+
+struct mcib_core_counters {
+    const mcib_counter_backend_t *be;
+    const mcib_counter_set_t     *set;
+    void                         *ctx;
+    int                           cpu;
+};
+
+int mcib_core_counters_open(const char *counter_set, const char *backend,
+                            mcib_core_counters_t **out, mcib_error_t *err)
+{
+    if (!out) { perr(err, EINVAL, "probe: no handle to write"); return -1; }
+    *out = NULL;
+
+    const mcib_counter_backend_t *be = mcib_backend_by_name(backend, err);
+    if (!be) return -1;                       /* message already set */
+
+    /* A thread-bound handle shared between two contexts would follow
+     * whichever thread opened it and stop counting whenever that thread was
+     * off-CPU — which, on the metric this exists for, is half the time and
+     * exactly the half being measured. Refused rather than accepted with a
+     * caveat. */
+    if (be->properties & MCIB_BE_FOLLOWS_THREAD) {
+        perr(err, EINVAL,
+             "probe: backend '%s' follows the thread, so a handle shared "
+             "between two contexts would count only the thread that opened "
+             "it. A core-scoped handle needs a CPU-bound backend.", be->name);
+        return -1;
+    }
+
+    int cpu = sched_getcpu();
+    if (cpu < 0) {
+        perr(err, errno, "probe: cannot determine the calling context's CPU, "
+                         "which a core-scoped handle must bind to: %s",
+             strerror(errno));
+        return -1;
+    }
+
+    const mcib_counter_set_t *set = mcib_counter_set_lookup(counter_set, err);
+    if (!set) return -1;                      /* message already set */
+
+    mcib_core_counters_t *h = calloc(1, sizeof *h);
+    if (!h) { perr(err, ENOMEM, "probe: out of memory"); return -1; }
+    h->be = be;
+    h->set = set;
+    h->cpu = cpu;
+    /* The backend checks that the caller is pinned to exactly one CPU and
+     * refuses otherwise, which is the half of the ordering rule that can be
+     * verified from here. That the handle exists before either context marks
+     * is the caller's, and cannot be checked from inside. */
+    if (be->open(set, &h->ctx, err) != 0) {
+        free(h);
+        return -1;
+    }
+    *out = h;
+    return 0;
+}
+
+void mcib_core_counters_close(mcib_core_counters_t *h)
+{
+    if (!h) return;
+    h->be->close(h->ctx);
+    free(h);
+}
+
+int mcib_core_counters_cpu(const mcib_core_counters_t *h)
+{
+    return h ? h->cpu : -1;
+}
+
+
 mcib_probe_t *mcib_probe_open(const mcib_probe_config_t *cfg, mcib_error_t *err)
 {
     if (err) { err->code = 0; err->msg[0] = 0; }
@@ -490,7 +582,38 @@ mcib_probe_t *mcib_probe_open(const mcib_probe_config_t *cfg, mcib_error_t *err)
     p->tsrc_cost_worst_ns = tc.cost_ns_worst;
     snprintf(p->tsrc_detail, sizeof p->tsrc_detail, "%s", tc.detail);
 
-    if (cfg->counters) {
+    p->core_cpu = -1;
+    if (cfg->counters && cfg->core_counters) {
+        /* A core-scoped handle supplies the backend, the set and the open
+         * accumulator. Naming a different set or backend beside it is a
+         * contradiction, and it is refused rather than resolved silently one
+         * way: a record claiming one counter set while reading another is
+         * exactly the class of defect the record format exists to prevent. */
+        const struct mcib_core_counters *h = cfg->core_counters;
+        if (cfg->counter_set &&
+            strcmp(cfg->counter_set, h->set->name) != 0) {
+            perr(err, EINVAL,
+                 "probe: the core-scoped handle counts set '%s' but this "
+                 "context asked for '%s'; one accumulator cannot be two sets",
+                 h->set->name, cfg->counter_set);
+            free(p->cal_d); free(p->cal); free(p->ev); free(p);
+            return NULL;
+        }
+        if (cfg->counter_backend &&
+            strcmp(cfg->counter_backend, h->be->name) != 0) {
+            perr(err, EINVAL,
+                 "probe: the core-scoped handle uses backend '%s' but this "
+                 "context asked for '%s'", h->be->name, cfg->counter_backend);
+            free(p->cal_d); free(p->cal); free(p->ev); free(p);
+            return NULL;
+        }
+        p->be    = h->be;
+        p->set   = h->set;
+        p->bectx = h->ctx;
+        p->counters = true;
+        p->counters_borrowed = true;
+        p->core_cpu = h->cpu;
+    } else if (cfg->counters) {
         p->be  = mcib_backend_by_name(cfg->counter_backend, err);
         if (!p->be) {                        /* message already set */
             free(p->cal_d); free(p->cal); free(p->ev); free(p);
@@ -522,7 +645,7 @@ mcib_probe_t *mcib_probe_open(const mcib_probe_config_t *cfg, mcib_error_t *err)
      * they do not land on the first recorded event. */
     if (calibrate(p) != 0) {
         perr(err, -1, "probe: self-calibration produced no usable interval");
-        if (p->counters) p->be->close(p->bectx);
+        if (p->counters && !p->counters_borrowed) p->be->close(p->bectx);
         free(p->cal_d); free(p->cal); free(p->ev); free(p);
         return NULL;
     }
@@ -747,9 +870,18 @@ static void write_header(FILE *f, const mcib_probe_t *p)
         fprintf(f, "# counters.preemption_detectable=%d\n",
                 (p->be->properties & MCIB_BE_PREEMPTION_DETECTABLE) ? 1 : 0);
         fprintf(f, "# counters.set=%s\n", p->set->name);
+        /* Whose accumulator the delta came from. A consumer differencing two
+         * contexts' snapshots must know they read ONE accumulator, and this
+         * is where it is told — without having to infer it from the backend
+         * name, which says what is counted and not who holds the handle. */
+        fprintf(f, "# counters.scope=%s\n",
+                p->counters_borrowed ? "core" : "context");
+        fprintf(f, "# counters.core_cpu=%d\n", p->core_cpu);
     } else {
         fprintf(f, "# counters.enabled=0\n");
         fprintf(f, "# counters.backend=none\n");
+        fprintf(f, "# counters.scope=none\n");
+        fprintf(f, "# counters.core_cpu=-1\n");
     }
 
     /* Flag legend: a record that cannot be read without the library's header
@@ -835,7 +967,7 @@ int mcib_probe_close(mcib_probe_t *p, const char *path, mcib_error_t *err)
         }
     }
 
-    if (p->counters) p->be->close(p->bectx);
+    if (p->counters && !p->counters_borrowed) p->be->close(p->bectx);
     free(p->cal_d);
     free(p->cal);
     free(p->ev);
