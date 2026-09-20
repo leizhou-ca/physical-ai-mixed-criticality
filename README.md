@@ -38,40 +38,54 @@ and it terminates in a verdict for each measured outlier:
 A benchmark that reports numbers without a verdict leaves the reader with
 homework. MCIB treats the verdict as the deliverable.
 
+**A `partition` verdict needs a partitioning mechanism to exist.** Neither
+platform in play has one — no cache partitioning, no colouring, no usable IOMMU
+controls — so none has been issued, and the tool reports which mechanisms it
+looked for and did not find. "No mechanism exists here" and "a mechanism exists
+and does not help" are different findings and are reported differently.
+
 ---
 
 ## Status — read this before citing anything here
 
-MCIB is a new project. It has produced no measurements yet. Everything in this
-repository is either specification or plan, and each claim is labelled.
+MCIB is a new project. Measurements exist; **no conforming dataset has been
+published**. Each claim below is tiered.
 
 | Tier | What exists | Where |
 |---|---|---|
-| **Measured** | *(nothing yet)* | — |
+| **Measured** | Four OS-primitive metrics on a Raspberry Pi 4B under PREEMPT_RT, across five aggressor conditions and two instrument configurations, repeated. A **method demonstration on a development board**, not a conforming dataset and not the reference platform | `framework/` |
 | **Specified** | Interference-channel taxonomy, instrument-agnostic attribution protocol, results schema with mandatory provenance | `spec/` |
+| **Built** | Probe library, four victims, interval reconstruction, counter and trace evidence, orchestrator. Verdict assignment is in progress | `framework/` |
 | **Planned** | Campaign #1 (Renesas R-Car V4H); Campaign #2 (ROS-native capture) | `campaigns/` |
 
-If you are looking for results, there are none here today. What there is: a
-schema you can target, a taxonomy you can argue with, and a plan you can tell
-me is wrong. All three are more useful to challenge now than after data exists.
+What there is to challenge today: a schema you can target, a taxonomy you can
+argue with, a harness you can read, and a plan you can tell me is wrong. All
+four are more useful to challenge now than after a dataset exists.
 
 ### What inspired this project
 
 MCIB was inspired by earlier benchmark work by the same author on POSIX RTOS
-primitives under Linux PREEMPT_RT ([DOI
-10.5281/zenodo.20967588](https://doi.org/10.5281/zenodo.20967588), Embedded
-World 2026). That work is **not** MCIB's data, and MCIB shares no code with
-it. It measured POSIX primitives on Arm Cortex-A72 with no AI inference
-workload present. Two things it surfaced led to this project:
+primitives under Linux PREEMPT_RT ([DOI 10.5281/zenodo.20967588](https://doi.org/10.5281/zenodo.20967588), Embedded
+World 2026). That work is **not** MCIB's data, and MCIB shares no code with it.
+It measured POSIX primitives on Arm Cortex-A72 with no AI inference workload
+present. Two things it surfaced led to this project:
 
-1. Worst-case tails run two to three orders of magnitude above median, and
-   P99.9 is not a safe WCET bound.
+1. Worst-case tails run far above the median, and P99.9 is not a safe WCET
+   bound.
 2. It characterised *that* the tails occur, not *why*. Attributing them to
    microarchitectural mechanisms was left as follow-on work.
 
 MCIB starts from that second observation, for a different problem:
 inference-plus-control workloads on shared silicon, rather than POSIX
 primitives measured in isolation.
+
+**A note on re-measurement.** Building MCIB's own harness meant re-measuring
+the same metrics on the same board, and several figures from that earlier work
+do not reproduce under a pinned CPU clock and a restated interval-construction
+rule. Where that is the case it is said so, in
+[`docs/mixed-criticality-primer.md`](docs/mixed-criticality-primer.md). Holding
+earlier work to the standard this project asks of everyone else's is not a
+footnote to the project — it is the project.
 
 ### On safety evidence
 
@@ -90,18 +104,28 @@ load-bearing and is enforced throughout the specification.
 spec/         Interference taxonomy, attribution protocol, results schema
 campaigns/    Per-platform measurement campaign plans
 docs/         Background notes, problem framing, regulatory context
-framework/    Benchmark harness (skeleton — see Status)
+framework/    The harness: probe, victims, analysis, orchestrator
 ```
+
+Start with [`framework/README.md`](framework/README.md) to build and run it, or
+[`docs/why-mcib.md`](docs/why-mcib.md) for the argument.
 
 ---
 
-## Reference platform
+## Platforms
 
-Campaign #1 targets the **Sparrow Hawk SBC** (Renesas R-Car V4H) running AGL
-SoDeV, a Xen-based multi-domain stack. This is the first port, not the only
-intended one. The specification itself is platform-neutral and ISA-neutral;
-the reference implementation is Arm-first because that is where the
-mixed-criticality silicon is.
+**Campaign #1 targets the Sparrow Hawk SBC** (Renesas R-Car V4H) running AGL
+SoDeV, a Xen-based multi-domain stack. That is the platform the project is
+aimed at.
+
+**The framework is currently validated on a Raspberry Pi 4B** under PREEMPT_RT
+Linux — a development board with no accelerator and no partitioning mechanism.
+It is where the harness is checked against something already measured, not
+where the interesting result lives.
+
+The specification itself is platform-neutral and ISA-neutral; the reference
+implementation is Arm-first because that is where the mixed-criticality silicon
+is.
 
 ---
 
@@ -114,7 +138,9 @@ The most valuable contributions right now, in order:
    we do not have is worth more than a feature.
 2. **Review of the attribution protocol.** If the taxonomy misses an
    interference channel you have hit in production, open an issue.
-3. **ROS-native capture.** See Campaign #2.
+3. **A conformance self-test.** A port currently has no way to check itself
+   except by reproducing a dataset, which is no help to anyone without one.
+4. **ROS-native capture.** See Campaign #2.
 
 A design constraint worth stating up front: MCIB **integrates with** the
 existing ROS tracing ecosystem and does not fork or reimplement it. If a
@@ -138,8 +164,8 @@ here. Open an issue or reach me via the contact on my
 ## Licence
 
 - **Code** (`framework/`, tooling, scripts): Apache License 2.0 — see [LICENSE](LICENSE)
-- **Documents and datasets** (`spec/`, `campaigns/`, `docs/`): Creative Commons
-  Attribution 4.0 International — see [LICENSE-docs](LICENSE-docs)
+- **Documents and datasets** (`spec/`, `campaigns/`, `docs/`, and README files):
+  Creative Commons Attribution 4.0 International — see [LICENSE-docs](LICENSE-docs)
 
 ## Citing this work
 
@@ -148,7 +174,7 @@ The earlier work that inspired this project:
 > Zhou, L. (2026). *Is Linux RT-PREEMPT Ready for Automotive Safety-Critical
 > Workloads? A Systematic Benchmark Evaluation.* Embedded World Conference
 > 2026, Nuremberg, Germany, March 10–12, 2026, Session 2.3 — RTOS
-> Orchestration. Zenodo. https://doi.org/10.5281/zenodo.20967588
+> Orchestration. Zenodo. <https://doi.org/10.5281/zenodo.20967588>
 
 ## Maintainer
 

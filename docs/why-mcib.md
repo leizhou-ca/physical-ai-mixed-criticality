@@ -92,9 +92,11 @@ make routine.
 
 ## A first measurement
 
-The method is small enough to demonstrate on a four-core Arm board running
-PREEMPT_RT Linux — one core isolated for a latency-sensitive task, the others
-loaded with synthetic CPU, memory and I/O work.
+The method is small enough to demonstrate on a four-core Arm development board
+running PREEMPT_RT Linux — one core isolated for a latency-sensitive task, the
+others loaded with synthetic CPU, memory and I/O work. This is a method
+demonstration on hardware with no accelerator and no partitioning mechanism,
+not a result about the silicon the project is aimed at.
 
 The first attempt said the aggressors were making the task *faster*. They were
 not. The per-run CPU clock, recorded alongside each measurement, had varied
@@ -112,6 +114,12 @@ that kernel build moves it. Verdict: `ceiling`.
 Two verdicts, one afternoon, from a metric that would otherwise have produced
 a table of numbers and no explanation. That is the whole argument for this
 project in miniature: the measurement was never the hard part.
+
+The same exercise re-measured metrics from the earlier work that inspired this
+project, and several of its figures did not reproduce once the clock was pinned
+and the interval rule was stated. Those qualifications are in the
+[primer](mixed-criticality-primer.md), because a project arguing that numbers
+need attribution cannot exempt its own antecedents.
 
 ## Objectives
 
@@ -147,11 +155,14 @@ each and replaces none.
 ## Where it stands
 
 Early, and honest about it. The specification is drafted and public. The
-framework is being built. The measurement above was produced with the
-method, on predecessor instrumentation, while the harness is under
-construction; reproducing it is one of the harness's acceptance criteria.
-No conforming dataset exists yet, and this file will say so until one does —
-see the status table in the README.
+harness exists — probe, four victims, interval reconstruction, counter and
+trace evidence, and an orchestrator — and verdict assignment is being built.
+
+The measurement above was produced with the method on predecessor
+instrumentation, while the harness was under construction; reproducing it is
+one of the harness's acceptance criteria, and it does. **No conforming dataset
+has been published**, and this file will say so until one has — see the status
+table in the README.
 
 What is not yet shown: a `partition` verdict, which needs a platform with a
 resource-partitioning mechanism, and any result with a real inference
