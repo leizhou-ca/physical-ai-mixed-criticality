@@ -399,14 +399,23 @@ def write_capture(cap, path):
 
 
 def collect_around(cpu, command, out_path, events=DEFAULT_EVENTS,
-                   pages=DEFAULT_RING_PAGES, window_record=None):
-    """Collect while `command` runs, then write the capture."""
+                   pages=DEFAULT_RING_PAGES, window_record=None,
+                   stdout=None):
+    """Collect while `command` runs, then write the capture.
+
+    `stdout` is a path the command's output is redirected to, because a
+    sequencer that captures a victim's output when it runs it directly must
+    not stop doing so when it runs it under collection: two arrangements that
+    differ in what they keep are two experiments."""
     import subprocess
     c = Collector(cpu, events, pages)
     c.start()
+    out = open(stdout, "w") if stdout else None
     try:
-        rc = subprocess.call(command)
+        rc = subprocess.call(command, stdout=out)
     finally:
+        if out:
+            out.close()
         c.stop()
     window = (measured_window_from_record(window_record)
               if window_record else None)

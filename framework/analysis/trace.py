@@ -367,6 +367,49 @@ def trace_evidence(artefact_path, capture_path, thresholds=None, root=None,
                     "coverage %.4f is below the floor %.4f: the enrichment is "
                     "real but explains too little of the outlier population "
                     "to be its explanation" % (coverage, coverage_floor))
+
+        # ---- separation: evidence a ratio cannot express -------------------
+        #
+        # ENRICHMENT IS A RATIO; SEPARATION IS NOT. Where an event occurs in a
+        # large fraction of outlier intervals and ZERO times in the nominal
+        # population there is no denominator, and the zero-denominator rule
+        # above correctly withholds a ratio: that rule exists to stop a SMALL
+        # numerator over an absent denominator claiming infinity, which is the
+        # arithmetic that once produced a cache verdict on a run with no
+        # aggressor.
+        #
+        # A large numerator over a hard zero is the opposite case. It is not a
+        # weak signal to be guarded against; it is the strongest result this
+        # instrument can produce, and withholding it was making the clearest
+        # finding in the dataset unreportable.
+        #
+        # So it is reported as its own kind of evidence, with COVERAGE as its
+        # statistic and its absolute counts beside it. No ratio is computed
+        # and none is implied — nothing here turns into an infinity. The
+        # thresholds are the ones the ratio path already uses: a separated
+        # event must clear the same minimum counts and the same coverage
+        # floor, so nothing was introduced to make a finding appear.
+        e["separated"] = False
+        e["separation"] = None
+        if (not e["self_excluded"] and n_count == 0 and o_count >= min_out
+                and (o_count + n_count) >= min_total
+                and coverage is not None and coverage >= coverage_floor):
+            e["separated"] = True
+            e["separation"] = {
+                "statistic": "coverage of the outlier population",
+                "coverage_of_outliers": coverage,
+                "outlier_occurrences": o_count,
+                "nominal_occurrences": 0,
+                "n_outlier_intervals": n_out,
+                "n_nominal_intervals": n_nom,
+                "coverage_floor": coverage_floor,
+                "minimum_outlier_occurrences": min_out,
+                "minimum_total_occurrences": min_total,
+                "meaning": ("the event occurs in this fraction of the outlier "
+                            "population and NEVER in the nominal population. "
+                            "There is no denominator, so there is no ratio "
+                            "and no infinity; the coverage is the statistic"),
+            }
         out["events"][name] = e
 
     # An event that was asked for and never arrived is a fact about the run,
@@ -380,8 +423,121 @@ def trace_evidence(artefact_path, capture_path, thresholds=None, root=None,
                 "no_signal_reason": "requested but never occurred on the "
                                     "measured core during the run",
                 "self_excluded": False, "coverage_of_outliers": 0.0,
+                "separated": False, "separation": None,
             }
     return out
+
+
+
+# ------------------------------------------------- the separation differential
+#
+# A WITHIN-RUN PROPERTY IS NOT AN EFFECT OF THE AGGRESSOR. The counter tier has
+# required this of its channels from the start: one implicated on both sides
+# equally is not the aggressor's doing. A separated event is no different, and
+# this is where that is computed — on the evidence, not in the rules.
+#
+# "MATERIALLY" IS THE CELL'S OWN REPEAT SPREAD. The floor is not a number
+# chosen here or borrowed from the counter tier, whose common-mode band is a
+# ratio of ratios and a different quantity with different noise. It is the
+# variation coverage shows across the repeats of this cell when nothing
+# changed, computed from the artefacts each time and recorded with the result.
+#
+# The wider of the two sides' spreads is used, which is the convention the
+# interval differential already applies to exactly this question — a shift is
+# resolvable when it exceeds the wider of the two sides' repeat spreads. Taking
+# one side's alone would let a cell that happened to be quiet on one side
+# certify a difference the other side's own noise covers.
+#
+# Nothing here names a verdict class. The outcome is an evidence
+# classification, and what follows from it belongs to the rules.
+
+SEPARATION_HIGHER = "higher under the aggressor"
+SEPARATION_COMPARABLE = "comparable on both sides"
+SEPARATION_LOWER = "lower under the aggressor"
+
+
+def _coverage_series(evidence, name):
+    out = []
+    for e in evidence or []:
+        if e.get("refusals"):
+            continue
+        x = (e.get("events") or {}).get(name)
+        if x is None:
+            continue
+        out.append(x.get("coverage_of_outliers") or 0.0)
+    return out
+
+
+def difference_separation(on_evidence, off_evidence, thresholds=None):
+    """Difference each separated event's coverage across the two sides.
+
+    Takes the per-repeat tier-2 evidence of both sides; computes nothing it
+    is not given. Returns, per event: the coverage on each side with its
+    repeats, the difference, each side's repeat spread, the floor that
+    follows from them, and which of the three outcomes holds.
+
+    An event separated on the aggressor-on side is reported here whatever the
+    outcome, including when its coverage is LOWER under the aggressor. An
+    event less present under load is not the aggressor's mechanism, and
+    saying nothing about it would leave a reader unable to tell a considered
+    exclusion from an oversight."""
+    th = thresholds or Thresholds()
+    multiple = th.get("separation_spread_multiple")
+    on_ok = [e for e in (on_evidence or []) if e and not e.get("refusals")]
+    off_ok = [e for e in (off_evidence or []) if e and not e.get("refusals")]
+    if not on_ok or not off_ok or \
+       len(on_ok) != len(on_evidence or []) or \
+       len(off_ok) != len(off_evidence or []):
+        return {"usable": False,
+                "reason": ("tier-2 evidence is incomplete on at least one "
+                           "side; a difference cannot be taken across a set "
+                           "of repeats that is not the cell"),
+                "events": {}}
+
+    names = set()
+    for e in on_ok:
+        for n, x in (e.get("events") or {}).items():
+            if x.get("separated"):
+                names.add(n)
+
+    out = {}
+    med = th.get("median_quantile")
+    for name in sorted(names):
+        # Separated in EVERY repeat of the loaded side, on the same unanimity
+        # footing the rules already apply; a separation in one run of five is
+        # the tier-2 version of a shift smaller than the repeat spread.
+        if not all(((e.get("events") or {}).get(name) or {}).get("separated")
+                   for e in on_ok):
+            continue
+        on_c = sorted(_coverage_series(on_ok, name))
+        off_c = sorted(_coverage_series(off_ok, name))
+        if not on_c or not off_c:
+            continue
+        on_med, off_med = pct(on_c, med), pct(off_c, med)
+        on_spread = max(on_c) - min(on_c)
+        off_spread = max(off_c) - min(off_c)
+        floor = max(on_spread, off_spread) * multiple
+        diff = on_med - off_med
+        if diff > floor:
+            outcome = SEPARATION_HIGHER
+        elif -diff > floor:
+            outcome = SEPARATION_LOWER
+        else:
+            outcome = SEPARATION_COMPARABLE
+        out[name] = {
+            "outcome": outcome,
+            "on_coverage": on_med, "off_coverage": off_med,
+            "on_coverage_per_repeat": on_c,
+            "off_coverage_per_repeat": off_c,
+            "on_repeat_spread": on_spread, "off_repeat_spread": off_spread,
+            "difference": diff,
+            "floor": floor,
+            "floor_basis": ("the wider of the two sides' spreads of coverage "
+                            "across their own repeats, times %g" % multiple),
+            "margin_over_floor": (abs(diff) / floor) if floor else None,
+            "n_on_repeats": len(on_c), "n_off_repeats": len(off_c),
+        }
+    return {"usable": True, "reason": None, "events": out}
 
 
 def summarise(ev, stream=sys.stdout):

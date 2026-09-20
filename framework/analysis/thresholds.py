@@ -218,6 +218,57 @@ _ENTRIES = [
        "of 0.5 the two distributions are reported as not separated. The "
        "value is a guess."),
 
+    # ---- tier 2: the separation differential -------------------------------
+
+    _t("separation_spread_multiple", 1.0, PROV_DEFINITIONAL,
+       "How many of a cell's own repeat spreads a separated event's coverage "
+       "must exceed on the aggressor-on side before the difference counts as "
+       "the aggressor's doing. ONE, because a difference larger than the "
+       "noise is what a difference means; any other multiple would be a "
+       "number somebody picked.\n"
+       "THE FLOOR ITSELF IS NOT STORED HERE, and that is the point. It is "
+       "the wider of the two sides' spreads of coverage across their own "
+       "repeats, computed per cell from the artefacts and recorded with the "
+       "verdict, so a cell whose repeats were noisy demands more of the "
+       "difference than one whose repeats were tight. The counter tier's "
+       "common-mode band was deliberately NOT reused: that band is a ratio "
+       "of ratios, this is a difference of fractions, and a number carried "
+       "between two quantities with different noise has no provenance.\n"
+       "WHAT THE MEASUREMENT SAYS ABOUT THE FLOOR, 2026-09-20, 64 "
+       "cell-sides: the repeat spread of coverage runs 0.0053 to 0.0378, "
+       "median 0.0155, mean 0.0191. The differences it is asked to judge run "
+       "0.0007 to 0.0560, median 0.0126. The two distributions overlap "
+       "almost entirely, which is a fact about the instrument at five "
+       "repeats and is reported as one rather than resolved by lowering "
+       "anything."),
+
+    # ---- the verdict rules and their guards --------------------------------
+
+    _t("verdict_channel_enrichment_min", 1.20, PROV_GUESS,
+       "A hardware channel carries a verdict only when its enrichment ratio "
+       "on the aggressor-on side is at least this. It is a SECOND condition "
+       "on top of the channel being attributable: a channel can differ "
+       "between the two sides and still not be enriched in absolute terms, "
+       "and a verdict naming a channel whose outliers hold 4% more refills "
+       "than its nominals is a verdict about arithmetic. The value is set "
+       "equal to enrichment_common_mode_band because no evidence "
+       "distinguishes the two questions, not because they are the same "
+       "question. Both are guesses."),
+
+    _t("instrument_dominance_ratio", 1.0, PROV_DEFINITIONAL,
+       "The instrument exceeds the signal when the instrument-to-signal "
+       "ratio exceeds one. That is what the words mean, so the value is not "
+       "free to move; it is named here so that a reader scanning for "
+       "unexplained numbers finds it accounted for. Measured on this "
+       "campaign: task switching 2.86, preemption 2.30, messaging 1.11, "
+       "interrupt 0.57 — three of four metrics are dominated."),
+
+    _t("multiple_comparison_min_conditions", 2, PROV_DEFINITIONAL,
+       "A channel implicated in one condition and in no other is marked "
+       "provisional. The comparison needs at least this many conditions to "
+       "mean anything: with one condition examined, 'and no other' is a "
+       "statement about what was not measured."),
+
     # ---- preconditions -----------------------------------------------------
 
     _t("precondition_max_unmatched_fraction", 0.01, PROV_GUESS,
@@ -229,11 +280,25 @@ _ENTRIES = [
        "The same for events the interval rule rejected. The value is a "
        "guess."),
 
-    _t("precondition_null_interval_tolerance", 0.10, PROV_GUESS,
-       "Two artefacts are comparable instruments only if their null "
-       "intervals agree within this relative tolerance. An instrument that "
-       "changed between the two sides of a differential is measuring a "
-       "different thing on each. The value is a guess."),
+    _t("precondition_null_interval_floor_ns", 150.0, PROV_GUESS,
+       "Two sides of a differential are comparable instruments when their "
+       "null intervals differ by no more than the LARGER of this floor and "
+       "the wider side's own spread across its repeats. It replaces a "
+       "relative tolerance, which was wrong in a specific and measurable "
+       "way: expressed as a fraction, the same absolute difference fails the "
+       "precise arm and passes the imprecise one. Measured on this campaign, "
+       "a counters-off differential whose null intervals spanned 296-388 ns "
+       "was refused while a counters-on one spanning 2185-2333 ns passed, "
+       "although the second differs by more than twice as many nanoseconds. "
+       "An instrument is not less comparable for being more precise.\n"
+       "PROVENANCE, STATED PRECISELY BECAUSE HALF OF IT IS NOT A "
+       "MEASUREMENT. Two sessions on this board with every setting identical "
+       "differed by 74 ns in their null interval; that figure is measured. "
+       "This floor is two of them. The doubling is judgement — nobody has "
+       "measured how far session-to-session variation actually reaches — so "
+       "the entry as a whole is filed as a guess, which is the unflattering "
+       "reading and the correct one. A result that depends on it can be "
+       "found by moving it."),
 
     # ---- definitional ------------------------------------------------------
 

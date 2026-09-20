@@ -14,6 +14,13 @@
 # Rules here:
 #   token-pair        two events with equal token, one opening and one closing.
 #                     Works within one context and across two.
+#
+# WHERE THE COUNTER DELTA COMES FROM IS PART OF THE RULE. An interval's
+# timestamps may span two contexts; its counter delta must not have to. A
+# victim whose waiting context brackets its own block with two marks declares
+# that pair as a COUNTER SEGMENT, and the rule returns it beside the interval
+# it belongs to. The segment is always within one context, and no value is
+# ever differenced across two.
 #   yield-successor   for an interval with no carryable token: the arrival is
 #                     the next event in the merged stream from another context.
 import sys
@@ -51,15 +58,19 @@ TOKEN_PAIR_PARAMS = {
     "pairing_key": "token",
     "rejection_policy": (
         "a token carried by exactly one opening and one closing event is "
-        "matched; a token seen once is unmatched; a token seen more than "
-        "twice is rejected as ambiguous, since nothing in the stream says "
-        "which occurrence belongs to which; a pair whose closing event does "
-        "not follow its opening event in time is rejected as out of order"),
+        "matched; a token seen once is unmatched; a token carrying more than "
+        "one opening or more than one closing event is rejected as "
+        "ambiguous, since nothing in the stream says which occurrence "
+        "belongs to which; a pair whose closing event does not follow its "
+        "opening event in time is rejected as out of order. Events at any "
+        "other instrumented point are not endpoints and are not counted "
+        "here: they belong to the counter segment, if one is declared"),
     "halve_round_trip": False,
 }
 
 
-def token_pair(paths, metric, halve=False, with_endpoints=False):
+def token_pair(paths, metric, halve=False, with_endpoints=False,
+               counter_segment=None, with_counter_segment=False):
     """Pair events across all input records on an equal token.
 
     This is the rule a workload-carried token permits. Nothing in the hot path
@@ -81,14 +92,37 @@ def token_pair(paths, metric, halve=False, with_endpoints=False):
 
     intervals = []
     endpoints = []
+    counter_eps = []
     unmatched = {}
     rejected = {}
     cross = 0
 
+    # The declared counter segment, indexed by token. Both of its marks are
+    # in ONE context, which is checked here rather than assumed: a segment
+    # whose two ends were in different contexts would be the very thing this
+    # is here to avoid.
+    seg_index, seg_problems = {}, {}
+    if counter_segment:
+        want_ctx = counter_segment.get("context")
+        s_open = counter_segment["open_point_id"]
+        s_close = counter_segment["close_point_id"]
+        for e in [x for st in streams for x in st]:
+            if want_ctx is not None and e[4] != want_ctx:
+                continue
+            if e[1] == s_open:
+                seg_index.setdefault(e[0], {})["open"] = e
+            elif e[1] == s_close:
+                seg_index.setdefault(e[0], {})["close"] = e
+
     for tok, evs in by_token.items():
         opens = [e for e in evs if e[1] == PT_OPEN]
         closes = [e for e in evs if e[1] == PT_CLOSE]
-        if len(evs) > 2:
+        # Counted over the ENDPOINTS, not over every event carrying the
+        # token. On a record whose only points are the two endpoints the two
+        # tests are the same; they differ once a victim marks a counter
+        # segment, whose events carry the interval's token and are not
+        # endpoints of it.
+        if len(opens) > 1 or len(closes) > 1:
             rejected["token_seen_more_than_twice"] = \
                 rejected.get("token_seen_more_than_twice", 0) + 1
             continue
@@ -109,6 +143,27 @@ def token_pair(paths, metric, halve=False, with_endpoints=False):
             cross += 1
         intervals.append(c[2] - o[2])
         endpoints.append((o[5], o[6], c[5], c[6]))
+        if counter_segment:
+            pair = seg_index.get(tok) or {}
+            so, sc = pair.get("open"), pair.get("close")
+            if so is None or sc is None:
+                counter_eps.append(None)
+                seg_problems["counter_segment_incomplete"] = \
+                    seg_problems.get("counter_segment_incomplete", 0) + 1
+            elif so[5] != sc[5]:
+                counter_eps.append(None)
+                seg_problems["counter_segment_spans_two_contexts"] = \
+                    seg_problems.get("counter_segment_spans_two_contexts", 0) + 1
+            elif so[2] > o[2]:
+                # The segment must open before the interval does. If it does
+                # not, the waiting context had not blocked when the interval
+                # started, so the delta does not bracket a block.
+                counter_eps.append(None)
+                seg_problems["counter_segment_opens_inside_the_interval"] = \
+                    seg_problems.get(
+                        "counter_segment_opens_inside_the_interval", 0) + 1
+            else:
+                counter_eps.append((so[5], so[6], sc[5], sc[6]))
 
     if tier == TIER_UNJOINABLE and cross:
         raise SystemExit(
@@ -128,8 +183,22 @@ def token_pair(paths, metric, halve=False, with_endpoints=False):
         "unmatched": {"count": sum(unmatched.values()), "by_reason": unmatched},
         "rejected": {"count": sum(rejected.values()), "by_clause": rejected},
     }
+    # Declared only when the victim declares one, so that an artefact from a
+    # victim with no counter segment is unchanged in every field.
+    if counter_segment:
+        params["counter_segment"] = dict(counter_segment)
+        pairing["counter_segment"] = {
+            "resolved": sum(1 for x in counter_eps if x is not None),
+            "unresolved": sum(1 for x in counter_eps if x is None),
+            "by_reason": seg_problems,
+            "rule": ("the counter delta for an interval is taken between the "
+                     "two declared points in the declared context; it is "
+                     "never differenced across contexts"),
+        }
     art = artefact("token-pair", TOKEN_PAIR_VERSION, params, paths, headers,
                    tier, evidence, pairing, ns, metric)
+    if with_counter_segment:
+        return art, ns, endpoints, (counter_eps if counter_segment else None)
     return (art, ns, endpoints) if with_endpoints else (art, ns)
 
 
@@ -151,7 +220,8 @@ YIELD_SUCCESSOR_PARAMS = {
 }
 
 
-def yield_successor(paths, metric, with_endpoints=False):
+def yield_successor(paths, metric, with_endpoints=False,
+                    with_counter_segment=False):
     """For an interval no context owns and no token can cross."""
     if len(paths) != 2:
         raise SystemExit("yield-successor takes exactly two records")
@@ -202,13 +272,43 @@ def yield_successor(paths, metric, with_endpoints=False):
     art = artefact("yield-successor", YIELD_SUCCESSOR_VERSION,
                    YIELD_SUCCESSOR_PARAMS, paths, headers, tier, evidence,
                    pairing, ns, metric)
+    if with_counter_segment:
+        # No counter segment is possible for a core-owned interval: neither
+        # context is present at both ends, so no pair of marks in one context
+        # brackets it. What this metric needs is a core-bound counter, which
+        # is a backend question and not a rule one.
+        return art, ns, endpoints, None
     return (art, ns, endpoints) if with_endpoints else (art, ns)
 
 
 RULES = {"token-pair": token_pair, "yield-successor": yield_successor}
 
 
-def apply_declared(art, paths, with_endpoints=False):
+def apply_named(rule_name, parameters, paths, metric, with_endpoints=False,
+                with_counter_segment=False):
+    """Apply a rule by name, with the parameters a caller declares.
+
+    This is the entry point a pipeline driver uses. It exists so that the
+    driver knows a rule's NAME and nothing about how the rule works: which
+    arguments token-pair takes, and that one metric's round trip is halved,
+    are facts about the rule, and a driver that knew them would have to be
+    edited whenever a rule gained one."""
+    if rule_name not in RULES:
+        raise ValueError("no such interval rule: %r; this build has %s"
+                         % (rule_name, ", ".join(sorted(RULES))))
+    parameters = parameters or {}
+    if rule_name == "token-pair":
+        return token_pair(paths, metric,
+                          bool(parameters.get("halve_round_trip")),
+                          with_endpoints=with_endpoints,
+                          counter_segment=parameters.get("counter_segment"),
+                          with_counter_segment=with_counter_segment)
+    return yield_successor(paths, metric, with_endpoints=with_endpoints,
+                           with_counter_segment=with_counter_segment)
+
+
+def apply_declared(art, paths, with_endpoints=False,
+                   with_counter_segment=False):
     """Re-apply the rule an artefact declares, with the parameters it declares.
 
     An artefact states the rule, its version and its parameters precisely so
@@ -233,10 +333,14 @@ def apply_declared(art, paths, with_endpoints=False):
             "rebuilding it would compare two different rules"
             % (name, declared, implemented))
     if name == "token-pair":
-        halve = bool(art["rule"]["parameters"].get("halve_round_trip"))
+        params = art["rule"]["parameters"]
+        halve = bool(params.get("halve_round_trip"))
         return token_pair(paths, art["metric"], halve,
-                          with_endpoints=with_endpoints)
-    return yield_successor(paths, art["metric"], with_endpoints=with_endpoints)
+                          with_endpoints=with_endpoints,
+                          counter_segment=params.get("counter_segment"),
+                          with_counter_segment=with_counter_segment)
+    return yield_successor(paths, art["metric"], with_endpoints=with_endpoints,
+                           with_counter_segment=with_counter_segment)
 
 
 def main(argv):

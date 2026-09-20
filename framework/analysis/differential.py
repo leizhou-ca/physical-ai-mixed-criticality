@@ -161,6 +161,150 @@ def _load_side(paths):
     return repeats
 
 
+CLOCK_MET = "met"
+CLOCK_FAILED = "failed"
+CLOCK_UNVERIFIABLE = "unverifiable"
+
+
+def _clock_state(repeats):
+    """The clock-state precondition, read from the artefacts' conditions.
+
+    The derived-interval artefact carries its run's conditions forward for
+    exactly this check, and it is the check this project most
+    needs: an unpinned governor has been measured on this board dominating
+    per-stressor differences outright, so a differential that cannot see the
+    clock is a differential that assumes it.
+
+    Three outcomes, and the third is not the second. An artefact whose
+    conditions say the clock was pinned at maximum, before and after, meets
+    it. One whose conditions say it was not, fails it. One that carries no
+    conditions, or carries conditions that never recorded the frequency, is
+    UNVERIFIABLE — and stays unverifiable however many of its siblings are
+    fine, because the question is about this run's clock and nothing else
+    can answer it."""
+    per, verdicts = [], set()
+    for r in repeats:
+        name = os.path.basename(r["artefact_path"])
+        cond = r["artefact"].get("conditions")
+        if not cond or cond.get("source") == "absent":
+            per.append({"artefact": name, "state": CLOCK_UNVERIFIABLE,
+                        "detail": "the artefact carries no conditions block"})
+            verdicts.add(CLOCK_UNVERIFIABLE)
+            continue
+        readings, scopes = [], []
+        for moment in ("before", "after"):
+            cap = cond.get(moment)
+            if not cap:
+                readings.append(None)
+                continue
+            clk = cap.get("clock") or {}
+            readings.append(clk.get("pinned_at_max"))
+            if clk.get("pinned_at_max_scope"):
+                scopes.append(clk["pinned_at_max_scope"])
+        if any(v is False for v in readings):
+            state = CLOCK_FAILED
+        elif all(v is True for v in readings) and readings:
+            state = CLOCK_MET
+        else:
+            state = CLOCK_UNVERIFIABLE
+        per.append({"artefact": name, "state": state,
+                    "before": readings[0] if readings else None,
+                    "after": readings[1] if len(readings) > 1 else None,
+                    "conditions_source": cond.get("source"),
+                    "scope": sorted(set(scopes)) or None})
+        verdicts.add(state)
+
+    if CLOCK_FAILED in verdicts:
+        bad = [p["artefact"] for p in per if p["state"] == CLOCK_FAILED]
+        return {"state": CLOCK_FAILED, "per_artefact": per,
+                "statement": ("the clock was not pinned at maximum for %s; a "
+                              "per-stressor comparison taken with the "
+                              "governor free has already been found on this "
+                              "project to measure the governor rather than "
+                              "the stressor" % ", ".join(bad))}
+    if CLOCK_UNVERIFIABLE in verdicts:
+        bad = [p["artefact"] for p in per
+               if p["state"] == CLOCK_UNVERIFIABLE]
+        return {"state": CLOCK_UNVERIFIABLE, "per_artefact": per,
+                "statement": ("the clock state cannot be read for %d of %d "
+                              "artefacts (%s); their conditions do not record "
+                              "it" % (len(bad), len(per), ", ".join(bad)))}
+    scopes = sorted({s for p in per for s in (p.get("scope") or [])})
+    return {"state": CLOCK_MET, "per_artefact": per,
+            "statement": ("every artefact on both sides records its clock "
+                          "pinned at maximum before and after its run%s"
+                          % (" (recorded for %s)" % "; ".join(scopes)
+                             if scopes else ""))}
+
+
+def _instrument_comparable(on, off, th):
+    """Whether the two sides measured with the same instrument.
+
+    AN ABSOLUTE RULE, NOT A RELATIVE ONE, and the difference is the whole
+    point. The null interval is what the instrument costs when it measures
+    nothing, and the question is whether it was the same on both sides. A
+    relative tolerance answers a different question — whether it varied by
+    the same FRACTION — and that penalises precision exactly backwards: a
+    counters-off arm whose null interval moves 90 ns out of 300 fails, while
+    a counters-on arm moving 150 ns out of 2200 passes, though the second
+    moved more. The instrument that changed less was the one refused.
+
+    So the two sides are comparable when the difference between them is no
+    larger than the wider of:
+
+      - a floor covering ordinary session-to-session variation, which this
+        board has been measured to have even with every setting identical;
+      - either side's own spread across its repeats, where there are
+        repeats. A side that varies by 80 ns between its own runs cannot
+        demand the other side agree to better than 80 ns.
+
+    The second term is the same principle the differential uses for its
+    noise floor: a difference smaller than the variation within a side is
+    not a difference between the sides."""
+    def nulls_of(side):
+        return [n for r in side
+                for n in r["artefact"]["instrument"]["null_interval_p50_ns"]]
+    n_on, n_off = nulls_of(on), nulls_of(off)
+    if not n_on or not n_off:
+        return {"comparable": None, "statement": "no null interval recorded",
+                "evidence": None}
+
+    med_on = pct(sorted(n_on), th.get("median_quantile"))
+    med_off = pct(sorted(n_off), th.get("median_quantile"))
+    spread_on = max(n_on) - min(n_on)
+    spread_off = max(n_off) - min(n_off)
+    floor = th.get("precondition_null_interval_floor_ns")
+    allowance = max(floor, spread_on, spread_off)
+    difference = abs(med_on - med_off)
+
+    evidence = {
+        "on_null_ns": sorted(n_on), "off_null_ns": sorted(n_off),
+        "on_median_ns": med_on, "off_median_ns": med_off,
+        "on_repeat_spread_ns": spread_on, "off_repeat_spread_ns": spread_off,
+        "difference_ns": difference,
+        "floor_ns": floor,
+        "allowance_ns": allowance,
+        "allowance_set_by": ("the floor" if allowance == floor else
+                             "the aggressor-on side's own repeat spread"
+                             if allowance == spread_on else
+                             "the aggressor-off side's own repeat spread"),
+    }
+    if difference > allowance:
+        return {
+            "comparable": False, "evidence": evidence,
+            "statement": (
+                "the two sides' null intervals differ by %.0f ns (on %.0f ns, "
+                "off %.0f ns), more than the %.0f ns allowed by %s; the "
+                "instrument was not the same on both sides"
+                % (difference, med_on, med_off, allowance,
+                   evidence["allowance_set_by"]))}
+    return {
+        "comparable": True, "evidence": evidence,
+        "statement": ("the two sides' null intervals differ by %.0f ns "
+                      "against %.0f ns allowed by %s"
+                      % (difference, allowance, evidence["allowance_set_by"]))}
+
+
 def check_preconditions(on, off, thresholds=None):
     """Every precondition of a differential, checked and named.
 
@@ -170,7 +314,7 @@ def check_preconditions(on, off, thresholds=None):
     `unverifiable` in the result."""
     th = thresholds or Thresholds()
     all_r = on + off
-    failures, unverifiable = [], []
+    failures, unverifiable, met = [], [], []
 
     def distinct(fn):
         return sorted({json.dumps(fn(r["artefact"]), sort_keys=True)
@@ -229,32 +373,32 @@ def check_preconditions(on, off, thresholds=None):
                 "%.4f" % (os.path.basename(r["artefact_path"]),
                           p["rejected"]["count"] / matched, max_rj))
 
-    nulls = [n for r in all_r
-             for n in r["artefact"]["instrument"]["null_interval_p50_ns"]]
-    if nulls:
-        lo, hi = min(nulls), max(nulls)
-        tol = th.get("precondition_null_interval_tolerance")
-        if lo > 0 and (hi - lo) / lo > tol:
-            failures.append(
-                "null intervals span %d-%d ns, a relative spread above %.4f; "
-                "the instrument was not the same on both sides" % (lo, hi, tol))
+    comparable = _instrument_comparable(on, off, th)
+    if comparable["comparable"] is False:
+        failures.append(comparable["statement"])
+    elif comparable["comparable"] is True:
+        met.append({"precondition": "instrument comparable",
+                    "statement": comparable["statement"],
+                    "evidence": comparable["evidence"]})
 
-    # Stated, not silently skipped. The clock-state precondition asks whether
-    # the core's clock was pinned at maximum on both sides. That is recorded
-    # in the run's conditions block, which the derived-interval artefact does
-    # not carry and this module is therefore not able to read. Reporting it
-    # as satisfied would be asserting something unchecked about the very
-    # thing most able to dominate a comparison — an unpinned governor has
-    # already been found to dominate per-stressor differences on this board.
-    unverifiable.append({
-        "precondition": "same board, same clock state",
-        "reason": ("the clock state is recorded in the run's conditions "
-                   "block; a derived-interval artefact does not carry one, "
-                   "so this module cannot check it from its declared inputs"),
-        "consequence": ("the comparison is computed and reported, and this "
-                        "precondition is reported as unchecked; it is not "
-                        "reported as met"),
-    })
+    clock = _clock_state(all_r)
+    if clock["state"] == CLOCK_FAILED:
+        failures.append(clock["statement"])
+    elif clock["state"] == CLOCK_UNVERIFIABLE:
+        unverifiable.append({
+            "precondition": "same board, same clock state",
+            "reason": clock["statement"],
+            "consequence": ("the comparison is computed and reported, and "
+                            "this precondition is reported as unchecked; it "
+                            "is not reported as met"),
+            "evidence": clock["per_artefact"],
+        })
+    else:
+        met.append({
+            "precondition": "same board, same clock state",
+            "statement": clock["statement"],
+            "evidence": clock["per_artefact"],
+        })
 
     if len(on) < th.get("differential_min_repeats") or \
        len(off) < th.get("differential_min_repeats"):
@@ -263,7 +407,7 @@ def check_preconditions(on, off, thresholds=None):
             "there is no spread, and no shift can be called resolvable"
             % (th.get("differential_min_repeats"), len(on), len(off)))
 
-    return {"failures": failures, "unverifiable": unverifiable,
+    return {"failures": failures, "unverifiable": unverifiable, "met": met,
             "passed": not failures}
 
 
@@ -468,6 +612,8 @@ def summarise(d, stream=sys.stdout):
         p("  PRECONDITION FAILED: %s" % f)
     for u in pre["unverifiable"]:
         p("  PRECONDITION UNCHECKED (%s): %s" % (u["precondition"], u["reason"]))
+    for m in pre.get("met", []):
+        p("  precondition met (%s): %s" % (m["precondition"], m["statement"]))
     if not pre["passed"]:
         p("  no comparison computed")
         return

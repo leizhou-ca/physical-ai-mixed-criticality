@@ -15,14 +15,24 @@
 # alongside its timestamps, so the counters for a measured section are the
 # difference between the two snapshots that bracket it, stored in the same
 # rows the interval was built from. Pairing is by construction, not by
-# timestamp, so nothing can drift. That is also the limit: where an
-# interval's two endpoints lie in DIFFERENT contexts, the difference between
-# their snapshots is the difference between two unrelated counter streams and
-# means nothing. Such intervals are counted and excluded, and where they are
-# all of them the run yields no counter evidence at all. This is a real
-# property of the metrics, not a shortfall of the implementation: an interval
-# that belongs to neither of the two contexts that bound it has no counter
-# delta to attribute, and saying so is the honest result.
+# timestamp, so nothing can drift.
+#
+# THE INSTRUMENT FOLLOWS THE INTERVAL'S OWNERSHIP, and the rule declares
+# where it is. Two arrangements reach this module:
+#
+#   - the interval belongs to one context throughout, and its own two
+#     endpoints carry the snapshots;
+#   - the interval belongs to a context that BLOCKS AND WAKES, and that
+#     context brackets its own block with a declared COUNTER SEGMENT. The
+#     interval's timestamps still span two contexts; its counter delta does
+#     not. Per-thread counters pause while the context is blocked, so the
+#     delta is the wakeup path and nothing else.
+#
+# What is never done is a difference between two contexts' snapshots. Two
+# per-thread counters are two streams that pause independently; two per-CPU
+# counters opened by two contexts are two accumulators with different
+# origins. Neither difference is a measurement of anything, and an interval
+# with no delta available is counted and excluded rather than given one.
 #
 # GUARDS. Every guard here exists because its absence produced a wrong
 # answer, not because it seemed prudent:
@@ -190,6 +200,79 @@ def _segment_qualified(header, switches_delta, open_flags, close_flags):
                    "delta cannot be said to cover the measured context")
 
 
+def _core_owned_qualification(headers, columns, rows, conditions):
+    """Whether a core-owned interval's delta covers the core and nothing else.
+
+    The context-switch test that qualifies a context-owned segment cannot be
+    applied here, and applying it anyway is how this metric came to report a
+    qualified fraction of zero: for a core-owned interval the switch IS the
+    measurement, so a rule that disqualifies a segment containing one asks a
+    question whose correct answer throws the measurement away.
+
+    What has to hold instead is that nothing else ran on the core. Three
+    facts establish it, and all three come from the run's own records and
+    conditions rather than from an assumption:
+
+      - every contributing context ran on the SAME core, and on the core the
+        handle counts;
+      - that core is isolated, so the scheduler placed no other runnable work
+        there;
+      - no context migrated during the run, so neither context left the core
+        and came back to a counter that had gone on without it.
+
+    This is a run-level verdict, not a per-segment one, because all three are
+    properties of the run. Where the conditions do not record the isolated
+    set, the second cannot be checked and the answer is NOT qualified: an
+    unisolated core is the one case this rule exists to exclude."""
+    cpus = sorted({h.get("context.cpu") for h in headers})
+    handle_cpus = sorted({h.get("counters.core_cpu") for h in headers})
+    evidence = {"context_cpus": cpus, "handle_cpus": handle_cpus,
+                "isolated_cpus": None, "migrations": {}}
+    if len(cpus) != 1 or cpus[0] is None:
+        return False, ("the contributing contexts report different cores "
+                       "(%s); a core-scoped delta covers one core"
+                       % ", ".join(str(c) for c in cpus)), evidence
+    if len(handle_cpus) != 1 or handle_cpus[0] != cpus[0]:
+        return False, ("the counter handle counts core %s while the contexts "
+                       "ran on core %s" % (handle_cpus, cpus[0])), evidence
+
+    isolated = None
+    for moment in ("before", "after"):
+        cap = (conditions or {}).get(moment) or {}
+        got = ((cap.get("isolation") or {}).get("isolated_cpus"))
+        if got is not None:
+            isolated = got if isolated is None else isolated
+    evidence["isolated_cpus"] = isolated
+    if isolated is None:
+        return False, ("the conditions do not record which cores were "
+                       "isolated, so it cannot be established that nothing "
+                       "else ran on core %s. An unisolated core is the case "
+                       "this rule exists to exclude, so the delta is not "
+                       "qualified" % cpus[0]), evidence
+    if int(cpus[0]) not in [int(c) for c in isolated]:
+        return False, ("core %s is not in the isolated set %s; other runnable "
+                       "work shared the core and is inside the delta"
+                       % (cpus[0], isolated)), evidence
+
+    total_migrations = 0
+    for h, ix, rws in zip(headers, columns, rows):
+        if "cpu_migrations" not in ix or len(rws) < 2:
+            continue
+        d = (int(rws[-1][ix["cpu_migrations"]])
+             - int(rws[0][ix["cpu_migrations"]]))
+        evidence["migrations"][h["context"]] = d
+        total_migrations += d
+    if total_migrations:
+        return False, ("%d CPU migrations occurred during the run (%s); a "
+                       "context that left the core and returned did not read "
+                       "a counter that followed it"
+                       % (total_migrations,
+                          ", ".join("%s=%d" % kv for kv in
+                                    sorted(evidence["migrations"].items())))), \
+               evidence
+    return True, None, evidence
+
+
 def counter_evidence(artefact_path, thresholds=None, root=None):
     """Tier-1 evidence for one derived-interval artefact.
 
@@ -232,8 +315,9 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
     # Rebuild the pairing through the rule the artefact declares, so that the
     # events a counter delta is taken across are the same two events the
     # interval was built from, decided by the same code.
-    _, intervals_ns, endpoints = apply_declared(art, paths,
-                                                with_endpoints=True)
+    declared_segment = art["rule"]["parameters"].get("counter_segment")
+    _, intervals_ns, endpoints, counter_endpoints = apply_declared(
+        art, paths, with_endpoints=True, with_counter_segment=True)
 
     headers, columns, rows = [], [], []
     for p in paths:
@@ -241,6 +325,29 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
         headers.append(h)
         columns.append({name: i for i, name in enumerate(c)})
         rows.append(r)
+
+    # A core-owned interval read from a core-scoped handle: one accumulator,
+    # referenced by both contexts, so the difference between their snapshots
+    # is one stream read twice rather than two accumulators subtracted.
+    core_scoped = bool(headers) and all(
+        h.get("counters.scope") == "core" for h in headers)
+    core_ok, core_why, core_evidence = (True, None, None)
+    if core_scoped:
+        core_ok, core_why, core_evidence = _core_owned_qualification(
+            headers, columns, rows, art.get("conditions"))
+    out["counter_scope"] = {
+        "scope": "core" if core_scoped else "context",
+        "qualified": core_ok if core_scoped else None,
+        "reason": core_why,
+        "evidence": core_evidence,
+        "rule": ("a core-owned interval is qualified when both contexts ran "
+                 "on the same isolated core and nothing migrated; the "
+                 "context-switch test does not apply, because for this "
+                 "interval the switch is the measurement"
+                 if core_scoped else
+                 "the delta is taken within one context and qualified per "
+                 "segment"),
+    }
 
     counter_names = [n for n in columns[0]
                      if n not in STRUCTURAL_COLUMNS]
@@ -251,20 +358,33 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
 
     samples = []            # (latency_ns, {counter: delta}, cycles_rate)
     cross_context = 0
+    segment_unavailable = 0
     unqualified = 0
     unqualified_reasons = {}
 
     hz = int(headers[0]["domain.frequency_hz"])
     ns_per_s = th.get("ns_per_second")
 
-    for (os_i, o_row, cs_i, c_row), latency in zip(endpoints, intervals_ns):
-        if os_i != cs_i:
+    for idx, (ep, latency) in enumerate(zip(endpoints, intervals_ns)):
+        os_i, o_row, cs_i, c_row = ep
+        if declared_segment:
+            # The delta comes from the declared segment, which is within one
+            # context by construction and checked to be so by the rule.
+            seg = counter_endpoints[idx]
+            if seg is None:
+                segment_unavailable += 1
+                continue
+            d_open_stream, d_open_row, d_close_stream, d_close_row = seg
+        elif os_i != cs_i and not core_scoped:
             cross_context += 1
             continue
-        hdr = headers[os_i]
-        ix = columns[os_i]
-        a = rows[os_i][o_row]
-        b = rows[cs_i][c_row]
+        else:
+            d_open_stream, d_open_row = os_i, o_row
+            d_close_stream, d_close_row = cs_i, c_row
+        hdr = headers[d_open_stream]
+        ix = columns[d_open_stream]
+        a = rows[d_open_stream][d_open_row]
+        b = rows[d_close_stream][d_close_row]
         o_flags = int(a[ix["flags"]], 16 if a[ix["flags"]].startswith("0x")
                       else 10)
         c_flags = int(b[ix["flags"]], 16 if b[ix["flags"]].startswith("0x")
@@ -272,7 +392,10 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
         sw = None
         if "context_switches" in ix:
             sw = int(b[ix["context_switches"]]) - int(a[ix["context_switches"]])
-        ok, why = _segment_qualified(hdr, sw, o_flags, c_flags)
+        if core_scoped:
+            ok, why = core_ok, core_why
+        else:
+            ok, why = _segment_qualified(hdr, sw, o_flags, c_flags)
         if not ok:
             unqualified += 1
             unqualified_reasons[why] = unqualified_reasons.get(why, 0) + 1
@@ -280,7 +403,15 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
         deltas = {}
         for name in counter_names:
             deltas[name] = int(b[ix[name]]) - int(a[ix[name]])
-        elapsed_ticks = int(b[ix["t_wall"]]) - int(a[ix["t_wall"]])
+        # The denominator of the displacement rate is the INTERVAL's own
+        # elapsed time, never the segment's. Where the segment brackets a
+        # block, most of its wall time is time the context was not running,
+        # and a rate over that would describe the wait rather than the
+        # wakeup. Cycles retired by the wakeup path against the latency being
+        # attributed is the figure that distinguishes a displaced context
+        # from a stalled one.
+        elapsed_ticks = (int(rows[cs_i][c_row][columns[cs_i]["t_wall"]])
+                         - int(rows[os_i][o_row][columns[os_i]["t_wall"]]))
         elapsed_ns = elapsed_ticks * ns_per_s / hz if hz else 0
         rate = (deltas["cpu_cycles"] / elapsed_ns
                 if "cpu_cycles" in deltas and elapsed_ns > 0 else None)
@@ -288,16 +419,26 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
 
     n_total = len(intervals_ns)
     n_attributable = len(samples)
-    qualified_fraction = (n_attributable / (n_total - cross_context)
-                          if n_total - cross_context else 0.0)
+    with_a_delta = n_total - cross_context - segment_unavailable
+    qualified_fraction = (n_attributable / with_a_delta
+                          if with_a_delta else 0.0)
 
     out["attributable_intervals"] = {
         "intervals_in_artefact": n_total,
         "cross_context_excluded": cross_context,
-        "same_context": n_total - cross_context,
+        "counter_segment_unavailable": segment_unavailable,
+        "same_context": n_total - cross_context - segment_unavailable,
         "qualified": n_attributable,
         "unqualified_excluded": unqualified,
     }
+    out["counter_segment"] = (
+        dict(declared_segment,
+             resolved=n_total - segment_unavailable,
+             unresolved=segment_unavailable,
+             note=("the counter delta is taken between these two points in "
+                   "this context, bracketing its block; the interval's own "
+                   "endpoints supply the timestamps only"))
+        if declared_segment else None)
     out["qualification"] = {
         "qualified": n_attributable,
         "unqualified": unqualified,
@@ -312,12 +453,17 @@ def counter_evidence(artefact_path, thresholds=None, root=None):
                  "never"),
     }
 
-    if cross_context == n_total and n_total:
+    if n_total and not with_a_delta:
         out["refusals"].append(
-            "every interval in this artefact is bounded by events in two "
-            "different contexts; the difference between two contexts' counter "
-            "snapshots is not a counter delta, so this metric yields no "
-            "tier-1 evidence")
+            "no interval in this artefact has a counter delta: every one is "
+            "bounded by events in two different contexts and the victim "
+            "declares no counter segment. The difference between two "
+            "contexts' counter snapshots is not a counter delta, so this "
+            "metric yields no tier-1 evidence as recorded"
+            if not declared_segment else
+            "the victim declares a counter segment but not one interval "
+            "resolved to a complete segment within a single context, so this "
+            "artefact yields no tier-1 evidence")
         return out
 
     if out["qualification"]["below_floor"]:
@@ -476,9 +622,16 @@ def summarise(ev, stream=sys.stdout):
         p("  REFUSED: %s" % r)
     a = ev.get("attributable_intervals")
     if a:
-        p("  intervals=%d cross-context=%d qualified=%d unqualified=%d"
+        p("  intervals=%d cross-context=%d no-segment=%d qualified=%d "
+          "unqualified=%d"
           % (a["intervals_in_artefact"], a["cross_context_excluded"],
+             a.get("counter_segment_unavailable", 0),
              a["qualified"], a["unqualified_excluded"]))
+        if ev.get("counter_segment"):
+            cs = ev["counter_segment"]
+            p("    counter segment: context '%s', points %s->%s, %d resolved"
+              % (cs.get("context"), cs["open_point_id"],
+                 cs["close_point_id"], cs["resolved"]))
         for why, n in sorted(ev["qualification"]["by_reason"].items()):
             p("    unqualified: %-52s %d" % (why, n))
     if ev["split"]:
