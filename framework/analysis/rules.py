@@ -24,11 +24,21 @@ from mcib_derive import (TIER_UNJOINABLE, artefact, derive_tier, load_record,
 PT_OPEN, PT_CLOSE = 1, 2
 
 
-def _events(path, want=("token", "point_id", "t_wall", "seq")):
+def _events(path, want=("token", "point_id", "t_wall", "seq"), stream=0):
+    """Events as tuples, plus where each one came from.
+
+    The trailing (stream, row) pair is appended AFTER the fields a rule
+    matches on, so every positional use of the earlier fields is unchanged.
+    It exists because a consumer of the intervals — counter attribution — has
+    to get back to the two event records an interval was built from, and the
+    rule is the only thing that knows which two they were. Recomputing the
+    pairing anywhere else would be a second path to the same number, and two
+    paths drift."""
     hdr, cols, rows = load_record(path)
     ix = {c: i for i, c in enumerate(cols)}
     ctx = hdr["context"]
-    out = [tuple([int(r[ix[w]]) for w in want] + [ctx]) for r in rows]
+    out = [tuple([int(r[ix[w]]) for w in want] + [ctx, stream, row])
+           for row, r in enumerate(rows)]
     return hdr, out
 
 
@@ -49,7 +59,7 @@ TOKEN_PAIR_PARAMS = {
 }
 
 
-def token_pair(paths, metric, halve=False):
+def token_pair(paths, metric, halve=False, with_endpoints=False):
     """Pair events across all input records on an equal token.
 
     This is the rule a workload-carried token permits. Nothing in the hot path
@@ -58,8 +68,8 @@ def token_pair(paths, metric, halve=False):
     closing events are in different contexts, the pairing is cross-context and
     the tier decides whether the interval may be emitted at all."""
     headers, streams = [], []
-    for p in paths:
-        h, e = _events(p)
+    for si, p in enumerate(paths):
+        h, e = _events(p, stream=si)
         headers.append(h)
         streams.append(e)
 
@@ -70,6 +80,7 @@ def token_pair(paths, metric, halve=False):
         by_token.setdefault(e[0], []).append(e)
 
     intervals = []
+    endpoints = []
     unmatched = {}
     rejected = {}
     cross = 0
@@ -97,6 +108,7 @@ def token_pair(paths, metric, halve=False):
         if o[4] != c[4]:
             cross += 1
         intervals.append(c[2] - o[2])
+        endpoints.append((o[5], o[6], c[5], c[6]))
 
     if tier == TIER_UNJOINABLE and cross:
         raise SystemExit(
@@ -116,8 +128,9 @@ def token_pair(paths, metric, halve=False):
         "unmatched": {"count": sum(unmatched.values()), "by_reason": unmatched},
         "rejected": {"count": sum(rejected.values()), "by_clause": rejected},
     }
-    return artefact("token-pair", TOKEN_PAIR_VERSION, params, paths, headers,
-                    tier, evidence, pairing, ns, metric), ns
+    art = artefact("token-pair", TOKEN_PAIR_VERSION, params, paths, headers,
+                   tier, evidence, pairing, ns, metric)
+    return (art, ns, endpoints) if with_endpoints else (art, ns)
 
 
 # ----------------------------------------------------------- yield-successor
@@ -138,13 +151,13 @@ YIELD_SUCCESSOR_PARAMS = {
 }
 
 
-def yield_successor(paths, metric):
+def yield_successor(paths, metric, with_endpoints=False):
     """For an interval no context owns and no token can cross."""
     if len(paths) != 2:
         raise SystemExit("yield-successor takes exactly two records")
     headers, streams = [], []
-    for p in paths:
-        h, e = _events(p)
+    for si, p in enumerate(paths):
+        h, e = _events(p, stream=si)
         headers.append(h)
         streams.append(e)
 
@@ -152,6 +165,7 @@ def yield_successor(paths, metric):
     merged = sorted([x for s in streams for x in s], key=lambda e: (e[2], e[1]))
 
     intervals = []
+    endpoints = []
     unmatched = {}
     rejected = {}
     arrival_was_open = 0
@@ -170,6 +184,7 @@ def yield_successor(paths, metric):
         if nxt[1] == PT_OPEN:
             arrival_was_open += 1
         intervals.append(nxt[2] - e[2])
+        endpoints.append((e[5], e[6], nxt[5], nxt[6]))
 
     if tier == TIER_UNJOINABLE and intervals:
         raise SystemExit("refusing to emit cross-domain intervals at tier "
@@ -184,12 +199,44 @@ def yield_successor(paths, metric):
         "unmatched": {"count": sum(unmatched.values()), "by_reason": unmatched},
         "rejected": {"count": sum(rejected.values()), "by_clause": rejected},
     }
-    return artefact("yield-successor", YIELD_SUCCESSOR_VERSION,
-                    YIELD_SUCCESSOR_PARAMS, paths, headers, tier, evidence,
-                    pairing, ns, metric), ns
+    art = artefact("yield-successor", YIELD_SUCCESSOR_VERSION,
+                   YIELD_SUCCESSOR_PARAMS, paths, headers, tier, evidence,
+                   pairing, ns, metric)
+    return (art, ns, endpoints) if with_endpoints else (art, ns)
 
 
 RULES = {"token-pair": token_pair, "yield-successor": yield_successor}
+
+
+def apply_declared(art, paths, with_endpoints=False):
+    """Re-apply the rule an artefact declares, with the parameters it declares.
+
+    An artefact states the rule, its version and its parameters precisely so
+    that it can be rebuilt from the records it names. Anything that needs the
+    pairing rather than the intervals — counter attribution needs the pair of
+    events each interval was built from, to difference their counter
+    snapshots — comes through here, so that there is exactly one
+    implementation of each rule and no consumer reconstructs one of its own.
+
+    Raises on a rule this module does not implement, rather than guessing:
+    an artefact naming an unknown rule cannot be attributed."""
+    name = art["rule"]["name"]
+    if name not in RULES:
+        raise ValueError("artefact names rule %r, which is not implemented "
+                         "here; it cannot be rebuilt" % name)
+    declared = art["rule"].get("version")
+    implemented = (TOKEN_PAIR_VERSION if name == "token-pair"
+                   else YIELD_SUCCESSOR_VERSION)
+    if declared != implemented:
+        raise ValueError(
+            "artefact was built by %s v%s but v%s is implemented here; "
+            "rebuilding it would compare two different rules"
+            % (name, declared, implemented))
+    if name == "token-pair":
+        halve = bool(art["rule"]["parameters"].get("halve_round_trip"))
+        return token_pair(paths, art["metric"], halve,
+                          with_endpoints=with_endpoints)
+    return yield_successor(paths, art["metric"], with_endpoints=with_endpoints)
 
 
 def main(argv):

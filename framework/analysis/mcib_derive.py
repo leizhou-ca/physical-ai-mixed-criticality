@@ -107,13 +107,79 @@ def instrument_block(headers, intervals_ns):
     }
 
 
+def characteristics(input_paths, headers, n_intervals):
+    """Derived characteristics of the records, per contributing context.
+
+    These are properties of the measured run rather than of the instrument or
+    of the intervals, so they sit in their own block. They live here, beside
+    the rules, for the reason the rules do: a characteristic computed in a
+    report's working script is a second path to a number, and two paths drift.
+
+    Every field is null where the counter set does not carry the event, rather
+    than absent, so a consumer can tell "not measured" from "not present in
+    this artefact version".
+
+    `cycles_per_second` is deliberately a rate and not a utilisation fraction.
+    Normalising it needs the core's clock, which is a conditions-block fact the
+    record does not carry; baking a nominal frequency in here would produce a
+    figure that is silently wrong on any other part or governor setting. A
+    consumer that knows the clock divides.
+
+    The segment figures are the per-event-pair deltas: what the counters moved
+    between one recorded event and the next, in that context. For a per-CPU
+    backend they cover the core rather than the context, which is why
+    `segments_with_a_switch` is carried alongside — a segment spanning a
+    context switch under such a backend includes whatever else ran."""
+    out = {}
+    for path, h in zip(input_paths, headers):
+        _, cols, rows = load_record(path)
+        ix = {c: i for i, c in enumerate(cols)}
+        ctx = h["context"]
+        hz = int(h["domain.frequency_hz"])
+        d = {"cycles_per_second": None,
+             "segment_cycles_p50": None,
+             "context_switches_per_interval": None,
+             "cpu_migrations_per_interval": None,
+             "segments": max(0, len(rows) - 1),
+             "segments_with_a_switch": None}
+
+        if len(rows) >= 2:
+            span = int(rows[-1][ix["t_wall"]]) - int(rows[0][ix["t_wall"]])
+            secs = span / hz if hz else 0
+            if "cpu_cycles" in ix and secs > 0:
+                dc = int(rows[-1][ix["cpu_cycles"]]) - int(rows[0][ix["cpu_cycles"]])
+                d["cycles_per_second"] = dc / secs
+                seg = [int(rows[i + 1][ix["cpu_cycles"]]) - int(rows[i][ix["cpu_cycles"]])
+                       for i in range(len(rows) - 1)]
+                seg.sort()
+                d["segment_cycles_p50"] = seg[len(seg) // 2]
+            for name, key in (("context_switches", "context_switches_per_interval"),
+                              ("cpu_migrations", "cpu_migrations_per_interval")):
+                if name in ix and n_intervals:
+                    dv = int(rows[-1][ix[name]]) - int(rows[0][ix[name]])
+                    d[key] = dv / n_intervals
+            if "context_switches" in ix:
+                nz = 0
+                prev = int(rows[0][ix["context_switches"]])
+                for r in rows[1:]:
+                    v = int(r[ix["context_switches"]])
+                    if v != prev:
+                        nz += 1
+                    prev = v
+                d["segments_with_a_switch"] = nz
+        out[ctx] = d
+    return out
+
+
 def artefact(rule_name, rule_version, parameters, input_paths, headers,
              tier, tier_evidence, pairing, intervals_ns, metric):
     """The derived-interval artefact (one per rule application)."""
     ns = sorted(intervals_ns)
     return {
         "artefact": "mcib.derived_intervals",
-        "artefact_version": 1,
+        # v2 adds the characteristics block; every other field is unchanged
+        # and re-derives byte-identically from the same records.
+        "artefact_version": 2,
         "metric": metric,
         "rule": {
             "name": rule_name,
@@ -129,6 +195,7 @@ def artefact(rule_name, rule_version, parameters, input_paths, headers,
         "tier_evidence": tier_evidence,
         "pairing": pairing,
         "instrument": instrument_block(headers, ns),
+        "characteristics": characteristics(input_paths, headers, len(ns)),
         "intervals": {
             "unit": "ns",
             "count": len(ns),
