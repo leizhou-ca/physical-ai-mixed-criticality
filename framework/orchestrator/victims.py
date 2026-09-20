@@ -40,6 +40,25 @@
 #     takes, or how much space it needs, gets this wrong by a factor of two
 #     for that victim unless it is declared.
 
+# Where a victim's counter delta comes from, when it is not the interval's own
+# two endpoints. A metric whose interval is owned by a context that BLOCKS AND
+# WAKES brackets its own block with two marks, and that pair — not the
+# interval's endpoints — is what tier 1 differences. Declared here because it
+# is a property of the victim's instrumentation, and carried into the artefact
+# by the rule, so that an analysis holding an artefact knows where the delta
+# came from without being told.
+#
+# The point ids are the victim's own. A metric with no entry here has its
+# delta taken from its interval's endpoints, which is correct exactly when one
+# context owns the whole interval.
+PT_WAIT_ENTER = 3
+PT_RESUME = 2
+
+WAITER_BLOCK_SEGMENT = {"context": "waiter",
+                        "open_point_id": PT_WAIT_ENTER,
+                        "close_point_id": PT_RESUME}
+
+
 RULE_TOKEN_PAIR = "token-pair"
 RULE_YIELD_SUCCESSOR = "yield-successor"
 
@@ -241,10 +260,15 @@ _add(Victim(
     extra_options={"priority_gap": "-g", "atomic_mode": "-A"},
     contexts=(Context("trigger", "trigger"), Context("waiter", "waiter")),
     rule=RULE_TOKEN_PAIR,
-    rule_parameters={"halve_round_trip": False},
+    # The interval's timestamps span the two contexts; its counter delta does
+    # not. The waiter brackets its own block, so the delta is the futex-wake
+    # path — the wake call, the scheduler, the resume — and nothing else.
+    rule_parameters={"halve_round_trip": False,
+                     "counter_segment": WAITER_BLOCK_SEGMENT},
     intervals_per_iteration=1,
     notes="cross-context but token-paired: the Nth signal causes the Nth "
-          "wake, and both contexts know which iteration they are in",
+          "wake, and both contexts know which iteration they are in. The "
+          "counter delta is taken in the waiter, bracketing its block",
 ))
 
 _add(Victim(
@@ -255,7 +279,11 @@ _add(Victim(
     extra_options={"priority_gap": "-g"},
     contexts=(Context("waiter", "waiter"), Context("trigger", "trigger")),
     rule=RULE_TOKEN_PAIR,
-    rule_parameters={"halve_round_trip": False},
+    # As for preemption latency: the waiter brackets its own block in poll(),
+    # so the delta is interrupt delivery and the wake path, not a difference
+    # between two threads' counters.
+    rule_parameters={"halve_round_trip": False,
+                     "counter_segment": WAITER_BLOCK_SEGMENT},
     intervals_per_iteration=1,
     # The tail is driven by rare events, so it is split higher than the
     # others. Declared here because it is a property of the metric.

@@ -40,8 +40,18 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
 
 from preconditions import _cpu_list as preconditions_cpu_list  # noqa: E402
+
+# Where a record's conditions live is a contract between the side that
+# writes them and the side that reads them into the artefact. It is defined
+# once, beside the artefact that carries the conditions forward, and
+# imported here: two implementations of the rule would eventually disagree
+# about which file belongs to which record, and the failure would be a run
+# whose conditions were written where nothing looks for them.
+from mcib_derive import conditions_path                      # noqa: E402,F401
 
 CONDITIONS_KIND = "mcib.conditions"
 CONDITIONS_VERSION = 1
@@ -263,27 +273,6 @@ def pair(before, after, tag, session):
         "drift": d,
         "drifted": bool(d),
     }
-
-
-def conditions_path(record_path):
-    """Where the conditions for a record live.
-
-    Derived from the record's own path rather than recorded in it, so that a
-    consumer holding a record can find them without an index, and so that
-    collecting a record and forgetting its conditions is not possible without
-    noticing."""
-    base = record_path
-    for suffix in (".csv",):
-        if base.endswith(suffix):
-            base = base[:-len(suffix)]
-            break
-    # Strip a context suffix: every context of one run shares one set of
-    # conditions, because they are one run.
-    parts = base.rsplit(".", 1)
-    if len(parts) == 2 and parts[1] in ("a", "b", "server", "trigger",
-                                        "waiter"):
-        base = parts[0]
-    return base + ".conditions.json"
 
 
 def write(pair_block, path):

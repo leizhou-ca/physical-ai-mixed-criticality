@@ -10,12 +10,21 @@
 # config will do and how long it will take, which is how someone catches a
 # mistake before spending forty minutes measuring the wrong thing.
 #
-# WHAT THIS BUILD DOES NOT DO. The pipeline is collect, derive, attribute,
-# report. This is the collecting half. Derivation and attribution exist as
-# their own tools and are not driven from here yet — the component that joins
-# the two halves is deliberately built last, on both sides, so that neither
-# half is shaped around a guess about the other. `run` therefore stops after
-# records and says so rather than implying a verdict is coming.
+# THE PIPELINE IS COLLECT, DERIVE, ATTRIBUTE, REPORT, and `run` is all four.
+# Each stage is also a command of its own, because a user debugging a port
+# needs them separately and a user who never decomposes the pipeline should
+# never have to.
+#
+# THE DRIVER IS THIN ON PURPOSE. It knows stage names, file paths, and which
+# rule a victim declares — nothing about how any stage works. Interval
+# construction lives in the rules; attribution lives in the analysis modules;
+# the verdict classes live in exactly one file and it is not this one. The
+# coupling between the collecting half and the analysing half is this file
+# and it is deliberately the thinnest thing that can join them.
+#
+# A STAGE FAILURE STOPS THE PIPELINE AND SAYS WHICH STAGE. A half-finished
+# pipeline must not look like a completed one: the failure names the stage,
+# the reason, and what exists on disk up to that point.
 import argparse
 import json
 import os
@@ -23,11 +32,49 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
+
 import config as config_mod                             # noqa: E402
 import preconditions                                    # noqa: E402
 import session as session_mod                           # noqa: E402
 import victims                                          # noqa: E402
 from adapters import LocalAdapter                       # noqa: E402
+
+import mcib_attribute                                   # noqa: E402
+import mcib_derive                                      # noqa: E402
+import rules                                            # noqa: E402
+from thresholds import Thresholds                       # noqa: E402
+
+DERIVED_DIR = "derived"
+VERDICTS_DIR = "verdicts"
+
+
+class StageError(Exception):
+    """A stage could not finish. Carries the stage's name so that the
+    pipeline can say which one stopped it."""
+
+    def __init__(self, stage, message):
+        Exception.__init__(self, message)
+        self.stage = stage
+        self.message = message
+
+
+def _thresholds(cfg):
+    """The analysis thresholds this session runs under.
+
+    Resolution order, stated in the config documentation and implemented
+    here: the defaults in the analysis threshold module, overridden by the
+    session config, recorded in every artefact. A name the analysis does not
+    have is refused here rather than ignored — a threshold silently dropped
+    is a session that ran under different numbers than the file asked for."""
+    try:
+        return Thresholds(overrides=cfg["thresholds"] or None)
+    except KeyError as e:
+        raise StageError("attribute",
+                         "the config sets a threshold this build does not "
+                         "have: %s. `python3 framework/analysis/thresholds.py`"
+                         " lists every threshold and its default" % e)
 
 
 def _load(path):
@@ -219,16 +266,201 @@ def cmd_collect(args, announce_stage=True):
           % os.path.join(cfg["output"], "resolved-config.yaml"))
     if announce_stage:
         print("")
-        print("This build stops after records. Deriving intervals and "
-              "attributing them")
-        print("are separate tools; the component that drives the whole "
-              "pipeline from this")
-        print("config is not in this build.")
-    return 1 if failed else 0
+        print("Records only. `mcib derive %s` builds intervals from them, "
+              "or `mcib run %s`" % (cfg["_source"], cfg["_source"]))
+        print("runs the whole pipeline.")
+    if failed:
+        raise StageError("collect",
+                         "%d of %d runs failed; the records for them do not "
+                         "exist and nothing downstream can be computed from "
+                         "them" % (len(failed), len(outcomes)))
+    return 0
+
+
+# ---------------------------------------------------------------- the stages
+#
+# Each one is a function of a config and the directory the previous stage
+# wrote. None of them knows how the stage beneath it works: `derive` asks the
+# victim manifest which rule a metric's events pair under and hands it to the
+# rules module; `attribute` hands a directory of artefacts and a threshold
+# set to the attribution driver; `report` reads what attribute wrote and
+# prints it.
+
+def stage_derive(cfg, log=print):
+    """Records to intervals, one artefact per run.
+
+    The driver knows which records a run produced and which rule the victim
+    declares, both of which it asks the manifest. It does not know what
+    either rule does."""
+    out = cfg["output"]
+    derived = os.path.join(out, DERIVED_DIR)
+    written, skipped = [], []
+    for block in session_mod.run_order(cfg):
+        for spec in block["runs"]:
+            metric = spec["metric"]
+            victim = victims.get(metric)
+            settings = session_mod.victim_settings(cfg, metric,
+                                                   spec["counters"])
+            base = os.path.join(out, spec["tag"] + ".csv")
+            records = [path for _, path in victim.records_for(base, settings)]
+            missing = [r for r in records if not os.path.exists(r)]
+            if missing:
+                raise StageError(
+                    "derive",
+                    "%s: the records this run should have written are not "
+                    "there (%s). Intervals cannot be derived from a run that "
+                    "did not produce a record"
+                    % (spec["tag"], ", ".join(os.path.basename(m)
+                                              for m in missing)))
+            os.makedirs(derived, exist_ok=True)
+            target = os.path.join(derived, spec["tag"] + ".json")
+            if os.path.exists(target):
+                skipped.append(target)
+                continue
+            art, ns = rules.apply_named(victim.rule, victim.rule_parameters,
+                                        records, metric)
+            mcib_derive.write_artefact(
+                art, target, values=[int(round(v)) for v in ns])
+            written.append(target)
+    log("  %d artefacts written, %d already present" % (len(written),
+                                                        len(skipped)))
+    return derived
+
+
+def stage_attribute(cfg, derived, log=print):
+    """Intervals to verdicts. The thresholds come from the config and are
+    recorded in every artefact written."""
+    if not os.path.isdir(derived):
+        raise StageError("attribute",
+                         "there is no %s directory; derive has not run"
+                         % derived)
+    th = _thresholds(cfg)
+    verdicts = os.path.join(cfg["output"], VERDICTS_DIR)
+    try:
+        artefacts, problems, index = mcib_attribute.attribute(
+            derived, verdicts, thresholds=th, session=cfg["session"],
+            root=cfg["output"], log=lambda *a: None)
+    except mcib_attribute.AttributionError as e:
+        raise StageError("attribute", str(e))
+    log("  %d cells, %d artefacts not in any cell" % (len(artefacts),
+                                                      len(problems)))
+    return verdicts
+
+
+def stage_report(cfg, verdicts, log=print):
+    index = os.path.join(verdicts, "verdicts.json")
+    if not os.path.exists(index):
+        raise StageError("report",
+                         "there is no %s; attribute has not run" % index)
+    render_verdicts(json.load(open(index)), verdicts)
+    return verdicts
+
+
+# ------------------------------------------------------------- presentation
+#
+# This renders; it derives nothing. Every figure below was decided by the
+# attribution stage and written into an artefact, and this reads it back.
+
+def render_verdicts(index, verdicts_dir, stream=sys.stdout):
+    p = lambda *a: print(*a, file=stream)
+    rows = index["cells"]
+    p("verdicts — session `%s`, from %s"
+      % (index.get("session") or "unnamed", index["derived"]))
+    p("")
+    p("  %-8s %-5s %-8s %-8s %-12s %-22s %s"
+      % ("metric", "arm", "counters", "aggressor", "verdict", "channel",
+         "flags"))
+    for r in rows:
+        p("  %-8s %-5s %-8s %-8s %-12s %-22s %s"
+          % (r["metric"], r["arm"], r["counter_state"], r["aggressor"],
+             r["verdict"], (r["channel"] or "-")[:22],
+             ", ".join(r["flags"]) or "-"))
+    p("")
+    classes = {}
+    for r in rows:
+        classes[r["verdict"]] = classes.get(r["verdict"], 0) + 1
+    p("  %d cells: %s" % (len(rows), ", ".join(
+        "%d %s" % (n, k) for k, n in sorted(classes.items()))))
+    for problem in index.get("not_in_any_cell", []):
+        p("  not in any cell: %s — %s" % (problem["artefact"],
+                                          problem["reason"]))
+    p("")
+    p("  Every verdict states the statistic it rests on, the thresholds it "
+      "was computed")
+    p("  under, and every input by content hash. `%s/<cell>.verdict.json` "
+      "has them." % verdicts_dir)
+
+
+def cmd_derive(args):
+    cfg = _load(args.config)
+    print("derive — %s" % cfg["_source"])
+    derived = stage_derive(cfg)
+    print("Intervals: %s" % derived)
+    return 0
+
+
+def cmd_attribute(args):
+    cfg = _load(args.config)
+    print("attribute — %s" % cfg["_source"])
+    verdicts = stage_attribute(cfg, os.path.join(cfg["output"], DERIVED_DIR))
+    print("Verdicts: %s" % verdicts)
+    print("")
+    stage_report(cfg, verdicts)
+    return 0
+
+
+def cmd_report(args):
+    cfg = _load(args.config)
+    return 0 if stage_report(
+        cfg, os.path.join(cfg["output"], VERDICTS_DIR)) else 1
 
 
 def cmd_run(args):
-    return cmd_collect(args, announce_stage=True)
+    """The whole pipeline: collect, derive, attribute, report.
+
+    A stage that fails stops the pipeline and says which stage and why. What
+    the earlier stages wrote stays on disk and is named, because a partial
+    result that can be resumed is worth more than a clean slate — but it is
+    never presented as a completed run."""
+    cfg = _load(args.config)
+    stages = ["collect", "derive", "attribute", "report"]
+    done = []
+    try:
+        print("=== collect")
+        if cmd_collect(args, announce_stage=False) != 0:
+            raise StageError("collect",
+                             "preconditions are not met, so nothing was "
+                             "measured. Every stage below this one would be "
+                             "computing from records that do not exist")
+        done.append("collect")
+        print("")
+        print("=== derive")
+        derived = stage_derive(cfg)
+        done.append("derive")
+        print("")
+        print("=== attribute")
+        verdicts = stage_attribute(cfg, derived)
+        done.append("attribute")
+        print("")
+        print("=== report")
+        stage_report(cfg, verdicts)
+        done.append("report")
+    except StageError as e:
+        print("")
+        print("mcib run: STOPPED IN STAGE `%s`" % e.stage, file=sys.stderr)
+        print("  %s" % e.message, file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  completed: %s" % (", ".join(done) or "nothing"),
+              file=sys.stderr)
+        print("  not run:   %s"
+              % ", ".join(x for x in stages if x not in done
+                          and x != e.stage), file=sys.stderr)
+        print("  output so far: %s" % cfg["output"], file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  This is not a completed run and its output is not a result.",
+              file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_victims(args):
@@ -273,8 +505,20 @@ def main(argv=None):
                         "result is not valid and says so")
     p.set_defaults(fn=cmd_collect)
 
-    p = sub.add_parser("run", help="the pipeline. In this build that is "
-                                   "collection only")
+    p = sub.add_parser("derive", help="records -> intervals")
+    p.add_argument("config")
+    p.set_defaults(fn=cmd_derive)
+
+    p = sub.add_parser("attribute", help="intervals -> verdicts")
+    p.add_argument("config")
+    p.set_defaults(fn=cmd_attribute)
+
+    p = sub.add_parser("report", help="verdicts -> a table, for humans")
+    p.add_argument("config")
+    p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("run", help="the whole pipeline: collect, derive, "
+                                   "attribute, report")
     p.add_argument("config")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_run)
@@ -286,7 +530,11 @@ def main(argv=None):
     if not getattr(args, "fn", None):
         ap.print_help()
         return 2
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except StageError as e:
+        print("mcib %s: %s" % (e.stage, e.message), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

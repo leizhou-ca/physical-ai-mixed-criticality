@@ -255,6 +255,18 @@ SCHEMA = {
                 "doc": "repeats per cell. The spread across them is the "
                        "noise floor a shift is judged against, so fewer than "
                        "two leaves nothing to judge against"},
+    "repeat_from": {"type": int, "default": 1,
+                    "doc": "the first repeat number this invocation runs. "
+                           "Present because a board whose card holds one "
+                           "block cannot hold a whole campaign: the repeats "
+                           "are run as separate invocations, and the records "
+                           "are collected off the target and cleared between "
+                           "them. It changes WHICH repeats run and nothing "
+                           "about what a run is — every other setting, the "
+                           "warm-up and the rotation of conditions inside a "
+                           "block are unchanged, so repeat 3 taken this way "
+                           "is the same experiment as repeat 3 taken in one "
+                           "long session"},
     "output": {"type": str, "default": "./results/",
                "doc": "where records, captures and conditions are written"},
     "deploy": {"type": dict, "default": {}, "doc": "where binaries live",
@@ -620,7 +632,9 @@ def estimate(r):
     metrics = r["victim"]["metrics"]
     n_cond = len(r["aggressors"]["conditions"])
     n_state = len(r["counters"]["state"])
-    repeats = r["repeats"]
+    # The repeats this invocation runs, which is not always all of them:
+    # a campaign split across invocations to fit a small card runs a slice.
+    repeats = r["repeats"] - r.get("repeat_from", 1) + 1
     iters = r["victim"]["iterations"]
 
     runs = len(metrics) * n_cond * n_state * repeats

@@ -39,12 +39,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
 
 import conditions as conditions_mod                     # noqa: E402
+import trace_collect                                    # noqa: E402
 import preconditions                                    # noqa: E402
 import victims                                          # noqa: E402
 from config import CONDITION_TAG, estimate              # noqa: E402
 
+CAPTURES_DIR = "captures"
 STRESSOR_CGROUP = "/sys/fs/cgroup/stressor"
 SETTLE_SECONDS = 1
 TERMINATION_GRACE_SECONDS = 3
@@ -152,7 +156,30 @@ def build_plan(cfg, adapter):
         "victim_binaries": dict(
             (m, os.path.join(deploy, victims.get(m).binary)) for m in metrics),
         "hardware_preconditions": hw,
+        "collectors": _collectors_for(cfg, v["domain"]),
     }
+
+
+def _collectors_for(cfg, domain):
+    """The kernel-event collectors that run in the victim's own domain.
+
+    A collector in another domain is not refused here and not silently
+    ignored either — it is returned as declared and skipped with its reason
+    recorded, because this build opens per-CPU ring buffers through the
+    process that starts the victim and has no way to do that across an
+    adapter. A capture that never happened must not look like a capture that
+    found nothing."""
+    out = []
+    for spec in cfg.get("collectors") or []:
+        entry = dict(spec)
+        entry["usable"] = (spec.get("domain", "local") == domain)
+        if not entry["usable"]:
+            entry["skipped_because"] = (
+                "this build collects in the victim's own domain only; a "
+                "collector declared for domain '%s' is recorded and not run"
+                % spec.get("domain"))
+        out.append(entry)
+    return out
 
 
 def run_order(cfg):
@@ -163,7 +190,7 @@ def run_order(cfg):
     disagree, and the one printed is the one users would trust."""
     v = cfg["victim"]
     blocks = []
-    for repeat in range(1, cfg["repeats"] + 1):
+    for repeat in range(cfg.get("repeat_from", 1), cfg["repeats"] + 1):
         for metric in v["metrics"]:
             for state in cfg["counters"]["state"]:
                 runs = []
@@ -375,11 +402,39 @@ class Session(object):
 
         binary = self.plan["victim_binaries"][metric]
         argv = victim.command(binary, record, settings)
-        self.log("  run %-34s %s" % (spec["tag"], " ".join(argv[1:])))
+        collectors = [c for c in self.plan["collectors"] if c.get("usable")]
+        capture_path = None
+        if collectors:
+            os.makedirs(os.path.join(self.out, CAPTURES_DIR), exist_ok=True)
+            capture_path = os.path.join(self.out, CAPTURES_DIR,
+                                        spec["tag"] + ".capture.json")
+            if os.path.exists(capture_path):
+                raise SessionError(
+                    "%s already exists; a capture is written once, like the "
+                    "record it covers" % capture_path)
+        self.log("  run %-34s %s%s" % (spec["tag"], " ".join(argv[1:]),
+                                       "  +capture" if collectors else ""))
         t0 = time.time()
-        h = self.ad.start(argv, stdout=os.path.join(self.out,
-                                                    spec["tag"] + ".out"))
-        rc = h.wait()
+        capture = None
+        if collectors:
+            # The collector wraps the victim rather than running beside it:
+            # the ring buffers must be open before the first event the run
+            # produces and drained after the last, and only the component
+            # that starts the victim knows both instants. The victim's own
+            # record supplies the measured window in the counter domain,
+            # which is why the capture is taken after it has been written.
+            rc, capture = trace_collect.collect_around(
+                self.plan["victim_cpu"], argv, capture_path,
+                events=tuple(collectors[0].get("events")
+                             or trace_collect.DEFAULT_EVENTS),
+                pages=int(collectors[0].get("pages")
+                          or trace_collect.DEFAULT_RING_PAGES),
+                window_record=victim.primary_record(record, settings),
+                stdout=os.path.join(self.out, spec["tag"] + ".out"))
+        else:
+            h = self.ad.start(argv, stdout=os.path.join(self.out,
+                                                        spec["tag"] + ".out"))
+            rc = h.wait()
         elapsed = time.time() - t0
 
         after = conditions_mod.capture(self.ad, self.plan, "after", agg)
@@ -398,15 +453,31 @@ class Session(object):
             "seconds": elapsed, "records": [p for _, p in produced],
             "conditions": cpath, "drifted": pair["drifted"],
             "drift": pair["drift"], "missing_records": missing,
+            "capture": capture_path,
+            "capture_samples": capture["samples"] if capture else None,
+            "capture_dropped": capture["dropped"] if capture else None,
         }
-        if rc != 0 or missing:
+        # A capture that dropped events is not a short capture, it is a
+        # capture with a hole in it, and an enrichment computed over a hole is
+        # a number about the ring buffer. The run is failed so that it is
+        # re-run rather than repaired.
+        dropped = bool(capture and capture["dropped"])
+        if dropped:
+            result["error"] = (
+                "the capture dropped %d events; the ring was too small for "
+                "what this run produced" % capture["dropped"])
+        if rc != 0 or missing or dropped:
             result["failed"] = True
-            self.log("    FAILED rc=%d%s" % (rc, ", missing %s" % missing
-                                             if missing else ""))
+            self.log("    FAILED rc=%d%s%s"
+                     % (rc, ", missing %s" % missing if missing else "",
+                        ", %s" % result["error"] if dropped else ""))
         else:
             result["failed"] = False
-            self.log("    ok  %.1fs%s" % (elapsed,
-                                          "  DRIFT" if pair["drifted"] else ""))
+            self.log("    ok  %.1fs%s%s"
+                     % (elapsed,
+                        "  capture %d events" % capture["samples"]
+                        if capture else "",
+                        "  DRIFT" if pair["drifted"] else ""))
         return result
 
     def run(self):
