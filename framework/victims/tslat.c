@@ -57,6 +57,7 @@ static int   opt_counters = 1;
 static int   opt_relaxed  = 0;
 static const char *opt_out = "tslat_events.csv";
 static const char *opt_exec_context = "host";
+static const char *opt_counter_backend = NULL; /* NULL => default */
 static const char *opt_counter_set  = "armv3-sched";
 
 static pthread_barrier_t start_barrier;
@@ -122,6 +123,7 @@ static void *yielder(void *arg)
         .capacity          = (uint32_t)(opt_iters * 2 + 16),
         .counters          = opt_counters != 0,
         .counter_set       = opt_counter_set,
+        .counter_backend   = opt_counter_backend,
         .kts_policy        = MCIB_KTS_EVERY_EVENT,
         /* One domain: same process, same core, same counter register. The
          * record states the identity and frequency so the claim is checkable. */
@@ -198,7 +200,7 @@ static void usage(const char *me)
 int main(int argc, char **argv)
 {
     int c;
-    while ((c = getopt(argc, argv, "c:n:P:w:o:e:s:KR")) != -1) {
+    while ((c = getopt(argc, argv, "c:n:P:w:o:e:s:B:KR")) != -1) {
         switch (c) {
         case 'c': opt_cpu      = atoi(optarg); break;
         case 'n': opt_iters    = atol(optarg); break;
@@ -207,6 +209,7 @@ int main(int argc, char **argv)
         case 'o': opt_out      = optarg;       break;
         case 'e': opt_exec_context = optarg;   break;
         case 's': opt_counter_set  = optarg;   break;
+        case 'B': opt_counter_backend = optarg; break;
         case 'K': opt_counters = 0;            break;
         case 'R': opt_relaxed  = 1;            break;
         default:  usage(argv[0]); return 2;
