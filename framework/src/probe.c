@@ -491,7 +491,11 @@ mcib_probe_t *mcib_probe_open(const mcib_probe_config_t *cfg, mcib_error_t *err)
     snprintf(p->tsrc_detail, sizeof p->tsrc_detail, "%s", tc.detail);
 
     if (cfg->counters) {
-        p->be  = mcib_backend();
+        p->be  = mcib_backend_by_name(cfg->counter_backend, err);
+        if (!p->be) {                        /* message already set */
+            free(p->cal_d); free(p->cal); free(p->ev); free(p);
+            return NULL;
+        }
         p->set = mcib_counter_set_lookup(cfg->counter_set, err);
         if (!p->set) {                       /* message already set */
             free(p->cal_d); free(p->cal); free(p->ev); free(p);

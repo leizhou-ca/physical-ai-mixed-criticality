@@ -35,7 +35,8 @@ add_library(mcib_probe STATIC
     src/probe.c
     src/time_source.c
     src/events_arm.c
-    src/backend_linux_perf.c)
+    src/backend_linux_perf.c
+    src/backend_linux_percpu.c)
 target_include_directories(mcib_probe PUBLIC include PRIVATE src)
 target_link_libraries(mcib_probe PUBLIC pthread)
 
@@ -49,3 +50,15 @@ target_link_libraries(tslat PRIVATE mcib_probe)
 
 add_executable(prelat victims/prelat.c)
 target_link_libraries(prelat PRIVATE mcib_probe)
+
+add_executable(inlat victims/inlat.c)
+target_link_libraries(inlat PRIVATE mcib_probe)
+
+# Platform-capability probes. Not victims: they measure nothing and write no
+# record, they answer whether a mechanism exists on an image before anything
+# is built on it.
+# Capability probe, not part of a measurement. Built on request:
+#   cmake --build <dir> --target rdpmc_probe
+# It answers whether this platform can read a counter from userspace without
+# a syscall. On the reference platform it cannot.
+add_executable(rdpmc_probe EXCLUDE_FROM_ALL characterisation/rdpmc_probe.c)

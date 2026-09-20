@@ -50,8 +50,16 @@ typedef struct {
     void (*close)   (void *ctx);
 } mcib_counter_backend_t;
 
-/* The backend compiled in for this build. Exactly one per target. */
+/* The default backend for this build: counters bound to the calling context.
+ * Every shipped measurement uses this one. */
 const mcib_counter_backend_t *mcib_backend(void);
+
+/* Select a backend by name. NULL or an unknown name yields the default, and
+ * *err says which happened. Backends differ in WHAT they count, not only in
+ * how fast they read it, so the choice belongs at the call site and in the
+ * record rather than in a build flag. */
+const mcib_counter_backend_t *mcib_backend_by_name(const char *name,
+                                                   mcib_error_t *err);
 
 /* Platform event map — counter ENCODING, keyed by implementation.
  * Raw event codes are per-microarchitecture; an unknown platform is an

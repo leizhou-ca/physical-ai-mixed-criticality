@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -139,3 +140,23 @@ static const mcib_counter_backend_t linux_perf = {
 };
 
 const mcib_counter_backend_t *mcib_backend(void) { return &linux_perf; }
+
+/* Backends other than the default, declared where they are defined. */
+extern const mcib_counter_backend_t mcib_backend_linux_percpu;
+
+static const mcib_counter_backend_t *const registry[] = {
+    &linux_perf,
+    &mcib_backend_linux_percpu,
+};
+
+const mcib_counter_backend_t *mcib_backend_by_name(const char *name,
+                                                   mcib_error_t *err)
+{
+    if (!name || !*name) return &linux_perf;
+    for (size_t i = 0; i < sizeof registry / sizeof registry[0]; i++)
+        if (strcmp(registry[i]->name, name) == 0) return registry[i];
+    /* Not silently defaulted: a caller that asked for a backend counting
+     * something else must not be given the default and told nothing. */
+    set_err(err, EINVAL, "probe: unknown counter backend '%s'", name);
+    return NULL;
+}

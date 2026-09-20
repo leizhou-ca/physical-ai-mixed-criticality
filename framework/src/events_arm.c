@@ -92,6 +92,29 @@ static const mcib_counter_set_t set_arm_v3_sched = {
                PERF_COUNT_SW_CONTEXT_SWITCHES, PERF_COUNT_SW_CPU_MIGRATIONS },
 };
 
+/* A set for a metric whose subject is displacement rather than the memory
+ * system.
+ *
+ * One discretionary event: cycles. It is the numerator of a utilisation
+ * ratio — cycles retired against the interval's elapsed time — and that
+ * ratio is how work displacing the measured context shows up when no cache
+ * or branch channel moves. The prior campaign on this metric found every
+ * hardware counter at 1.0x and the mechanism visible only in the utilisation
+ * figure and in trace events, so adding cache or branch events here would
+ * buy nothing and cost per-event time.
+ *
+ * The other two are the backend's qualification counters, not a campaign
+ * slot — and on this metric they are also the direct evidence: an interrupt
+ * displacing the measured context is a context switch or a migration. */
+static const mcib_counter_set_t set_arm_v3_util = {
+    .name  = "armv3-util",
+    .n     = 3,
+    .names = { "cpu_cycles", "context_switches", "cpu_migrations" },
+    .type  = { PERF_TYPE_RAW, PERF_TYPE_SOFTWARE, PERF_TYPE_SOFTWARE },
+    .config= { EV_CPU_CYCLES,
+               PERF_COUNT_SW_CONTEXT_SWITCHES, PERF_COUNT_SW_CPU_MIGRATIONS },
+};
+
 /* Verified-for list. Adding a part here requires checking each code against
  * that part's technical reference manual. Presence here means someone
  * checked; absence means nobody has, not that the codes are wrong. */
@@ -165,6 +188,9 @@ const mcib_counter_set_t *mcib_counter_set_lookup(const char *name,
 
     if (strcmp(name, set_arm_v3_sched.name) == 0)
         return &set_arm_v3_sched;
+
+    if (strcmp(name, set_arm_v3_util.name) == 0)
+        return &set_arm_v3_util;
 
     if (err) {
         snprintf(err->msg, sizeof err->msg,

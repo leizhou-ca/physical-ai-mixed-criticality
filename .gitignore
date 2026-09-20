@@ -16,3 +16,5 @@ briefs
 briefs/reports/
 __pycache__/
 *.pyc
+__pycache__/
+*.pyc

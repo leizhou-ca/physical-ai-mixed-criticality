@@ -115,6 +115,13 @@ typedef struct {
     uint32_t          capacity;       /* pre-allocated event slots         */
     bool              counters;       /* request counter capture           */
     const char       *counter_set;    /* NULL => platform default set      */
+    /* Which counter-access backend to use. NULL selects the platform
+     * default, which is the per-thread one every measurement has used.
+     * Naming another is a characterisation act: a backend that binds
+     * counters to a CPU rather than to a context counts different things,
+     * and the record carries the name and the declared properties so a
+     * reader can tell which was used. */
+    const char       *counter_backend;
     mcib_kts_policy_t kts_policy;
     uint16_t          domain_id;      /* clock domain this context reads   */
 } mcib_probe_config_t;
